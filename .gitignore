@@ -1,0 +1,45 @@
+# Environment
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data & temp
+data/
+temp/
+*.db
+*.sqlite
+
+# Logs
+*.log
+logs/
+
+# Google Cloud credentials
+*-credentials.json
+service-account*.json
+
+# Playwright
+playwright-report/
+test-results/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation (except readme)
+*.md
+!readme.md

@@ -1,0 +1,8 @@
+python-telegram-bot>=20.0
+aiohttp>=3.9.0
+python-dotenv>=1.0.0
+google-cloud-vision>=3.5.0
+playwright>=1.40.0
+rapidfuzz>=3.5.0
+pydantic>=2.5.0
+redis>=5.0.0
