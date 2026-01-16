@@ -1,7 +1,7 @@
 # Rentlio Automation Telegram Bot
 
 ## Project Overview
-A Python-based Telegram bot designed to automate the guest check-in process and invoice creation for a private rental host ("paušalist") using the Rentlio PMS. The bot processes ID photos, matches them to reservations, performs online check-ins, and issues non-fiscalized invoices.
+A Python-based Telegram bot designed to automate the guest check-in process and invoice creation for a private rental host using the Rentlio PMS. The bot processes ID photos, matches them to reservations, performs online check-ins, and issues non-fiscalized invoices.
 
 ## Tech Stack
 * **Language:** Python 3.10+

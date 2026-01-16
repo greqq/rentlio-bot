@@ -31,6 +31,8 @@ from telegram.ext import (
 
 from src.config import config
 from src.services.rentlio_api import RentlioAPI, RentlioAPIError
+from src.services.ocr_service import ocr_service, ExtractedGuestData
+from src.services.form_filler import form_filler
 
 # Setup logging
 logging.basicConfig(
@@ -96,6 +98,11 @@ def format_reservation(res: dict, detailed: bool = False) -> str:
     return text.strip()
 
 
+# ========== Conversation States ==========
+STATE_WAITING_FOR_URL = "waiting_for_url"
+STATE_WAITING_FOR_INVOICE_CONFIRM = "waiting_for_invoice"
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send welcome message with menu"""
     keyboard = [
@@ -108,11 +115,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🏠 **Rentlio Bot**\n\n"
         "Dobrodošli! Odaberi opciju iz menija ispod 👇\n\n"
-        "Ili koristi komande:\n"
+        "**Komande:**\n"
         "/upcoming - Rezervacije sljedećih 7 dana\n"
         "/today - Današnji dolasci\n"
         "/tomorrow - Sutrašnji dolasci\n"
-        "/search <ime> - Pretraži po imenu gosta\n",
+        "/search <ime> - Pretraži po imenu gosta\n\n"
+        "**Check-in:**\n"
+        "📷 Pošalji sliku osobne iskaznice za OCR\n",
         parse_mode="Markdown",
         reply_markup=reply_markup
     )
@@ -298,11 +307,223 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🌅 Today - Današnji dolasci\n"
         "🌄 Tomorrow - Sutrašnji dolasci\n"
         "🔍 Search - Pretraži gosta\n\n"
-        "**Coming soon:**\n"
-        "📷 Pošalji sliku osobne → OCR extraction\n"
-        "🔗 Auto-fill check-in form\n",
+        "**Check-in:**\n"
+        "📷 Pošalji sliku osobne iskaznice\n"
+        "🔗 Bot će izvući podatke i tražiti URL\n"
+        "✅ Ispunit će formu automatski\n",
         parse_mode="Markdown"
     )
+
+
+# ========== Photo / Check-in Flow ==========
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle ID photo for OCR extraction"""
+    await update.message.reply_text("🔍 Procesiram sliku...")
+    
+    try:
+        # Get the largest photo
+        photo = update.message.photo[-1]
+        
+        # Download photo to memory
+        file = await context.bot.get_file(photo.file_id)
+        image_bytes = await file.download_as_bytearray()
+        
+        # Extract data with OCR
+        guest_data = await ocr_service.extract_from_bytes(bytes(image_bytes))
+        
+        # Delete the photo message for privacy
+        try:
+            await update.message.delete()
+            await update.message.reply_text("🗑️ _Slika obrisana iz sigurnosnih razloga_", parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"Could not delete photo: {e}")
+        
+        if not guest_data.is_valid():
+            await update.message.reply_text(
+                "❌ **Nisam uspio izvući podatke**\n\n"
+                f"Raw text:\n```\n{guest_data.raw_text[:500]}```\n\n"
+                "Pokušaj s boljom slikom (fokus, osvjetljenje).",
+                parse_mode="Markdown"
+            )
+            return
+        
+        # Store extracted data in context
+        context.user_data['guest_data'] = guest_data.to_dict()
+        context.user_data['state'] = STATE_WAITING_FOR_URL
+        
+        # Create keyboard with cancel option
+        keyboard = [[InlineKeyboardButton("❌ Odustani", callback_data="cancel_checkin")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            f"{guest_data.format_telegram()}\n\n"
+            "✅ Podaci izvučeni!\n\n"
+            "📎 Sada pošalji **check-in URL** link:\n"
+            "`https://sun-apartments.book.rentl.io/reservation/check-in/...`",
+            parse_mode="Markdown",
+            reply_markup=reply_markup
+        )
+        
+    except Exception as e:
+        logger.error(f"Photo processing error: {e}")
+        await update.message.reply_text(f"❌ Greška: {str(e)}")
+
+
+async def handle_checkin_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle check-in URL after photo was processed"""
+    text = update.message.text.strip()
+    
+    # Check if it's a valid check-in URL (support both short and full format)
+    # Short: ci.book.rentl.io/c/{uuid}/{code}
+    # Full: sun-apartments.book.rentl.io/reservation/check-in/{uuid}
+    is_short_url = 'ci.book.rentl.io' in text
+    is_full_url = 'book.rentl.io' in text and 'check-in' in text
+    
+    if not (is_short_url or is_full_url):
+        return False  # Not a check-in URL, let other handlers process it
+    
+    # Check if we're expecting a URL
+    if context.user_data.get('state') != STATE_WAITING_FOR_URL:
+        await update.message.reply_text(
+            "⚠️ Prvo pošalji sliku osobne iskaznice, pa onda URL."
+        )
+        return True
+    
+    guest_data = context.user_data.get('guest_data')
+    if not guest_data:
+        await update.message.reply_text(
+            "⚠️ Nema podataka o gostu. Pošalji prvo sliku osobne."
+        )
+        return True
+    
+    # Store URL (form_filler will transform if needed)
+    context.user_data['checkin_url'] = text
+    context.user_data['state'] = None
+    
+    # Show confirmation
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Ispuni formu", callback_data="fill_form"),
+            InlineKeyboardButton("❌ Odustani", callback_data="cancel_checkin")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"🔗 **URL primljen!**\n\n"
+        f"👤 Gost: **{guest_data.get('fullName', 'N/A')}**\n"
+        f"🪪 ID: {guest_data.get('documentNumber', 'N/A')}\n"
+        f"🎂 DOB: {guest_data.get('dateOfBirth', 'N/A')}\n\n"
+        f"Želiš da ispunim check-in formu?",
+        parse_mode="Markdown",
+        reply_markup=reply_markup
+    )
+    return True
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline button callbacks"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "cancel_checkin":
+        context.user_data.clear()
+        await query.edit_message_text("❌ Check-in otkazan.")
+        
+    elif query.data == "fill_form":
+        checkin_url = context.user_data.get('checkin_url')
+        guest_data = context.user_data.get('guest_data')
+        
+        if not checkin_url or not guest_data:
+            await query.edit_message_text("❌ Greška: nedostaju podaci.")
+            return
+        
+        await query.edit_message_text("⏳ Ispunjavam formu... (ovo može potrajati 10-30 sec)")
+        
+        try:
+            # Fill the form using Playwright
+            result = await form_filler.fill_form(checkin_url, guest_data)
+            
+            if result.success:
+                # Send screenshot of filled form
+                if result.screenshot:
+                    await context.bot.send_photo(
+                        chat_id=query.message.chat_id,
+                        photo=result.screenshot,
+                        caption="✅ **Forma ispunjena!**\n\nPregledaj podatke i ručno potvrdi na stranici.",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=query.message.chat_id,
+                        text=f"✅ Forma ispunjena!\n\n{result.message}",
+                        parse_mode="Markdown"
+                    )
+                
+                # Ask about invoice
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ Da, generiraj", callback_data="generate_invoice"),
+                        InlineKeyboardButton("❌ Ne", callback_data="skip_invoice")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text="🧾 Želiš generirati račun za ovog gosta?",
+                    reply_markup=reply_markup
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=f"❌ **Greška pri ispunjavanju forme:**\n\n{result.message}\n\n"
+                         f"Pokušaj ručno ispuniti formu:\n{checkin_url}",
+                    parse_mode="Markdown"
+                )
+                context.user_data.clear()
+                
+        except Exception as e:
+            logger.error(f"Form filling error: {e}")
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"❌ Greška: {str(e)}\n\nPokušaj ručno: {checkin_url}"
+            )
+            context.user_data.clear()
+        
+    elif query.data == "generate_invoice":
+        await query.edit_message_text("🧾 Generiranje računa... (TODO)")
+        # TODO: Call Rentlio API to generate invoice
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="✅ Račun generiran! (placeholder)\n\n_Invoice API integration coming soon_",
+            parse_mode="Markdown"
+        )
+        context.user_data.clear()
+        
+    elif query.data == "skip_invoice":
+        await query.edit_message_text("👍 OK, bez računa.")
+        context.user_data.clear()
+
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages - check if it's a URL or menu button"""
+    text = update.message.text
+    
+    # Check if it's a check-in URL (short or full format)
+    if 'ci.book.rentl.io' in text or ('book.rentl.io' in text and 'check-in' in text):
+        handled = await handle_checkin_url(update, context)
+        if handled:
+            return
+    
+    # Check if it's a menu button
+    if any(emoji in text for emoji in ['📅', '🌅', '🌄', '🔍', '❓']):
+        await handle_menu_buttons(update, context)
+        return
+    
+    # Unknown text
+    # Don't respond to avoid spam
 
 
 async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -471,10 +692,16 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("notifications", toggle_notifications))
     
-    # Handle menu button presses
+    # Handle photo messages (for OCR)
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    
+    # Handle callback queries (inline buttons)
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    
+    # Handle text messages (URLs and menu buttons)
     app.add_handler(MessageHandler(
-        filters.TEXT & filters.Regex(r"^(📅|🌅|🌄|🔍|❓)"), 
-        handle_menu_buttons
+        filters.TEXT & ~filters.COMMAND,
+        handle_text_message
     ))
     
     # Error handler

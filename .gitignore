@@ -43,3 +43,4 @@ Thumbs.db
 # Documentation (except readme)
 *.md
 !readme.md
+gen-lang-client*.json
