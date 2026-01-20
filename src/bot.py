@@ -100,6 +100,7 @@ def format_reservation(res: dict, detailed: bool = False) -> str:
 
 # ========== Conversation States ==========
 STATE_WAITING_FOR_URL = "waiting_for_url"
+STATE_WAITING_FOR_ANOTHER_GUEST = "waiting_for_another_guest"
 STATE_WAITING_FOR_INVOICE_CONFIRM = "waiting_for_invoice"
 
 
@@ -348,19 +349,31 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # Store extracted data in context
-        context.user_data['guest_data'] = guest_data.to_dict()
-        context.user_data['state'] = STATE_WAITING_FOR_URL
+        # Initialize guests list if needed
+        if 'guests' not in context.user_data:
+            context.user_data['guests'] = []
         
-        # Create keyboard with cancel option
-        keyboard = [[InlineKeyboardButton("❌ Odustani", callback_data="cancel_checkin")]]
+        # Add this guest to the list
+        context.user_data['guests'].append(guest_data.to_dict())
+        guest_count = len(context.user_data['guests'])
+        
+        # Create keyboard to add another or proceed
+        keyboard = [
+            [
+                InlineKeyboardButton("➕ Dodaj još gosta", callback_data="add_another_guest"),
+            ],
+            [
+                InlineKeyboardButton("✅ Nastavi s URL-om", callback_data="proceed_to_url"),
+                InlineKeyboardButton("❌ Odustani", callback_data="cancel_checkin")
+            ]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
             f"{guest_data.format_telegram()}\n\n"
-            "✅ Podaci izvučeni!\n\n"
-            "📎 Sada pošalji **check-in URL** link:\n"
-            "`https://sun-apartments.book.rentl.io/reservation/check-in/...`",
+            f"✅ **Gost {guest_count} dodan!**\n\n"
+            f"👥 Ukupno gostiju: {guest_count}\n\n"
+            "Dodaj još gosta ili nastavi s check-in URL-om?",
             parse_mode="Markdown",
             reply_markup=reply_markup
         )
@@ -390,8 +403,8 @@ async def handle_checkin_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return True
     
-    guest_data = context.user_data.get('guest_data')
-    if not guest_data:
+    guests = context.user_data.get('guests', [])
+    if not guests:
         await update.message.reply_text(
             "⚠️ Nema podataka o gostu. Pošalji prvo sliku osobne."
         )
@@ -400,6 +413,11 @@ async def handle_checkin_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Store URL (form_filler will transform if needed)
     context.user_data['checkin_url'] = text
     context.user_data['state'] = None
+    
+    # Build guest summary
+    guest_summary = ""
+    for i, guest in enumerate(guests, 1):
+        guest_summary += f"\n👤 **Gost {i}:** {guest.get('fullName', 'N/A')} ({guest.get('documentNumber', 'N/A')})"
     
     # Show confirmation
     keyboard = [
@@ -411,10 +429,9 @@ async def handle_checkin_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        f"🔗 **URL primljen!**\n\n"
-        f"👤 Gost: **{guest_data.get('fullName', 'N/A')}**\n"
-        f"🪪 ID: {guest_data.get('documentNumber', 'N/A')}\n"
-        f"🎂 DOB: {guest_data.get('dateOfBirth', 'N/A')}\n\n"
+        f"🔗 **URL primljen!**\n"
+        f"{guest_summary}\n\n"
+        f"👥 Ukupno: {len(guests)} gost(a)\n\n"
         f"Želiš da ispunim check-in formu?",
         parse_mode="Markdown",
         reply_markup=reply_markup
@@ -430,20 +447,48 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "cancel_checkin":
         context.user_data.clear()
         await query.edit_message_text("❌ Check-in otkazan.")
+    
+    elif query.data == "add_another_guest":
+        # User wants to add another guest - set state and wait for photo
+        context.user_data['state'] = STATE_WAITING_FOR_ANOTHER_GUEST
+        guest_count = len(context.user_data.get('guests', []))
+        await query.edit_message_text(
+            f"👥 Ukupno gostiju: {guest_count}\n\n"
+            f"📷 Pošalji sliku osobne iskaznice za **Gosta {guest_count + 1}**",
+            parse_mode="Markdown"
+        )
+    
+    elif query.data == "proceed_to_url":
+        # User done adding guests, proceed to URL
+        context.user_data['state'] = STATE_WAITING_FOR_URL
+        guests = context.user_data.get('guests', [])
+        
+        # Build guest summary
+        guest_summary = ""
+        for i, guest in enumerate(guests, 1):
+            guest_summary += f"\n👤 Gost {i}: {guest.get('fullName', 'N/A')}"
+        
+        await query.edit_message_text(
+            f"✅ **{len(guests)} gost(a) spremno!**\n"
+            f"{guest_summary}\n\n"
+            f"📎 Sada pošalji **check-in URL** link:\n"
+            f"`https://sun-apartments.book.rentl.io/reservation/check-in/...`",
+            parse_mode="Markdown"
+        )
         
     elif query.data == "fill_form":
         checkin_url = context.user_data.get('checkin_url')
-        guest_data = context.user_data.get('guest_data')
+        guests = context.user_data.get('guests', [])
         
-        if not checkin_url or not guest_data:
+        if not checkin_url or not guests:
             await query.edit_message_text("❌ Greška: nedostaju podaci.")
             return
         
-        await query.edit_message_text("⏳ Ispunjavam formu... (ovo može potrajati 10-30 sec)")
+        await query.edit_message_text(f"⏳ Ispunjavam formu za {len(guests)} gost(a)... (ovo može potrajati 10-30 sec)")
         
         try:
-            # Fill the form using Playwright
-            result = await form_filler.fill_form(checkin_url, guest_data)
+            # Fill the form using Playwright - pass list of guests
+            result = await form_filler.fill_form(checkin_url, guests)
             
             if result.success:
                 # Send screenshot of filled form
@@ -451,7 +496,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_photo(
                         chat_id=query.message.chat_id,
                         photo=result.screenshot,
-                        caption="✅ **Forma ispunjena!**\n\nPregledaj podatke i ručno potvrdi na stranici.",
+                        caption=f"✅ **Forma ispunjena za {len(guests)} gost(a)!**",
                         parse_mode="Markdown"
                     )
                 else:
@@ -472,7 +517,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 await context.bot.send_message(
                     chat_id=query.message.chat_id,
-                    text="🧾 Želiš generirati račun za ovog gosta?",
+                    text="🧾 Želiš generirati račun?",
                     reply_markup=reply_markup
                 )
             else:

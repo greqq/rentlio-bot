@@ -53,20 +53,24 @@ class FormFillerService:
         # Unknown format, return as-is
         return url
     
-    async def fill_form(self, url: str, guest_data: Dict[str, Any]) -> FormFillerResult:
+    async def fill_form(self, url: str, guests_data: list | Dict[str, Any]) -> FormFillerResult:
         """
         Fill the online check-in form with guest data
         
         Args:
             url: Check-in URL (short or full format)
-            guest_data: Dictionary with guest information
+            guests_data: List of guest dictionaries OR single guest dict for backward compatibility
         
         Returns:
             FormFillerResult with success status and optional screenshot
         """
+        # Handle single guest (backward compatibility)
+        if isinstance(guests_data, dict):
+            guests_data = [guests_data]
+        
         # Transform URL if needed
         full_url = self.transform_url(url)
-        logger.info(f"Filling form at: {full_url}")
+        logger.info(f"Filling form at: {full_url} for {len(guests_data)} guest(s)")
         
         async with async_playwright() as p:
             try:
@@ -83,8 +87,15 @@ class FormFillerService:
                 await page.goto(full_url, wait_until='networkidle', timeout=30000)
                 await page.wait_for_timeout(2000)
                 
-                # Fill the form
-                filled_fields = await self._fill_form_fields(page, guest_data)
+                # Fill form for all guests
+                total_filled = 0
+                for guest_index, guest_data in enumerate(guests_data):
+                    logger.info(f"Filling guest {guest_index + 1}/{len(guests_data)}: {guest_data.get('fullName', 'Unknown')}")
+                    filled = await self._fill_guest_section(page, guest_data, guest_index)
+                    total_filled += filled
+                
+                # Click submit after filling all guests
+                await self._click_submit(page)
                 
                 # Scroll to top for screenshot
                 await page.evaluate("window.scrollTo(0, 0)")
@@ -97,7 +108,7 @@ class FormFillerService:
                 
                 return FormFillerResult(
                     success=True,
-                    message=f"✅ Ispunjeno {filled_fields} polja",
+                    message=f"✅ Ispunjeno {total_filled} polja za {len(guests_data)} gost(a)",
                     screenshot=screenshot
                 )
                 
@@ -116,8 +127,8 @@ class FormFillerService:
                     error=str(e)
                 )
     
-    async def _fill_form_fields(self, page: Page, guest_data: Dict[str, Any]) -> int:
-        """Fill individual form fields. Returns count of filled fields."""
+    async def _fill_guest_section(self, page: Page, guest_data: Dict[str, Any], guest_index: int) -> int:
+        """Fill form fields for a specific guest section. Returns count of filled fields."""
         filled = 0
         
         # Build full name
@@ -127,139 +138,206 @@ class FormFillerService:
             last = guest_data.get('lastName', '')
             full_name = f"{first} {last}".strip()
         
-        # 1. Fill IME I PREZIME (Name) - first input with this placeholder
+        # Determine the guest section container
+        # Guest 1 is "Primarni gost", Guest 2+ is "Gost N"
+        if guest_index == 0:
+            section_header = "Primarni gost"
+        else:
+            section_header = f"Gost {guest_index + 1}"
+        
+        logger.debug(f"Looking for section: {section_header}")
+        
+        # Scroll to the guest section header first
+        section_el = page.get_by_text(section_header, exact=True)
+        if await section_el.count() > 0:
+            await section_el.first.scroll_into_view_if_needed()
+            await page.wait_for_timeout(500)
+        
+        # Get all inputs for each field type - use nth() to target specific guest section
+        name_inputs = page.locator('input[placeholder="Unesite ime i prezime"]')
+        dob_inputs = page.locator('input[placeholder="Unesite datum (DD.MM.GGGG)"]')
+        doc_inputs = page.locator('input[placeholder="Unesite broj dokumenta"]')
+        res_inputs = page.locator('input[placeholder="Unesite mjesto prebivališta"]')
+        
+        # 1. Fill IME I PREZIME (Name)
         if full_name:
             try:
-                name_input = page.locator('input[placeholder="Unesite ime i prezime"]').first
+                name_input = name_inputs.nth(guest_index)
                 if await name_input.count() > 0:
+                    await name_input.scroll_into_view_if_needed()
                     await name_input.clear()
                     await name_input.fill(full_name.upper())
                     filled += 1
-                    logger.debug(f"Filled name: {full_name}")
+                    logger.debug(f"Guest {guest_index+1}: Filled name: {full_name}")
             except Exception as e:
-                logger.warning(f"Could not fill name: {e}")
+                logger.warning(f"Guest {guest_index+1}: Could not fill name: {e}")
         
-        # 2. Fill DATUM ROĐENJA (Date of Birth) - format DD.MM.GGGG
+        # 2. Fill DATUM ROĐENJA (Date of Birth)
         dob = guest_data.get('dateOfBirth', '')
         if dob:
             try:
-                dob_input = page.locator('input[placeholder="Unesite datum (DD.MM.GGGG)"]').first
+                dob_input = dob_inputs.nth(guest_index)
                 if await dob_input.count() > 0:
                     await dob_input.clear()
                     await dob_input.fill(dob)
                     filled += 1
-                    logger.debug(f"Filled DOB: {dob}")
+                    logger.debug(f"Guest {guest_index+1}: Filled DOB: {dob}")
             except Exception as e:
-                logger.warning(f"Could not fill DOB: {e}")
+                logger.warning(f"Guest {guest_index+1}: Could not fill DOB: {e}")
         
-        # 3. Select SPOL (Gender) - custom dropdown
+        # 3. Select SPOL (Gender) - click dropdown then click LAST visible option (in dropdown menu)
         gender = guest_data.get('gender', '')
         if gender:
             try:
-                # Click the dropdown placeholder
-                gender_dropdown = page.get_by_text("-- odaberite spol --").first
-                if await gender_dropdown.count() > 0:
-                    await gender_dropdown.click()
-                    await page.wait_for_timeout(300)
-                    
-                    # Select the option - options are "Ženski" and "Muški"
-                    if gender == 'F':
-                        option = page.get_by_text("Ženski", exact=True)
-                    else:
-                        option = page.get_by_text("Muški", exact=True)
-                    
-                    if await option.count() > 0:
-                        await option.first.click()
-                        filled += 1
-                        logger.debug(f"Selected gender: {gender}")
-                    else:
-                        # Close dropdown by clicking elsewhere
-                        await page.keyboard.press("Escape")
-            except Exception as e:
-                logger.warning(f"Could not select gender: {e}")
-        
-        # 4. Select TIP DOKUMENTA (Document Type) - default to Osobna iskaznica
-        try:
-            doc_type_dropdown = page.get_by_text("-- odaberite tip dokumenta --").first
-            if await doc_type_dropdown.count() > 0:
-                await doc_type_dropdown.click()
-                await page.wait_for_timeout(300)
+                gender_dropdowns = page.get_by_text("-- odaberite spol --")
+                clicked = False
                 
-                osobna = page.get_by_text("Osobna iskaznica")
-                if await osobna.count() > 0:
-                    await osobna.first.click()
-                    filled += 1
-                    logger.debug("Selected document type: Osobna iskaznica")
-                else:
-                    await page.keyboard.press("Escape")
+                for i in range(await gender_dropdowns.count()):
+                    el = gender_dropdowns.nth(i)
+                    if await el.is_visible():
+                        await el.scroll_into_view_if_needed()
+                        await page.wait_for_timeout(300)
+                        await el.click()
+                        await page.wait_for_timeout(500)
+                        
+                        # Click the option - use LAST visible (dropdown menu appears below existing values)
+                        if gender == 'F':
+                            opt = page.get_by_text("Ženski", exact=True)
+                        else:
+                            opt = page.get_by_text("Muški", exact=True)
+                        
+                        # Find the option with highest Y coordinate (in dropdown menu)
+                        best_idx = -1
+                        best_y = -1
+                        for j in range(await opt.count()):
+                            o = opt.nth(j)
+                            if await o.is_visible():
+                                box = await o.bounding_box()
+                                if box and box['y'] > best_y:
+                                    best_y = box['y']
+                                    best_idx = j
+                        
+                        if best_idx >= 0:
+                            await opt.nth(best_idx).click()
+                            clicked = True
+                            filled += 1
+                            logger.debug(f"Guest {guest_index+1}: Selected gender: {gender} (idx={best_idx}, y={best_y:.0f})")
+                        break
+                
+                if not clicked:
+                    logger.warning(f"Guest {guest_index+1}: Could not select gender")
+                
+                await page.wait_for_timeout(300)
+            except Exception as e:
+                logger.warning(f"Guest {guest_index+1}: Could not select gender: {e}")
+        
+        # 4. Select TIP DOKUMENTA (Document Type) - click dropdown then click LAST visible option
+        try:
+            doc_dropdowns = page.get_by_text("-- odaberite tip dokumenta --")
+            clicked = False
+            
+            for i in range(await doc_dropdowns.count()):
+                el = doc_dropdowns.nth(i)
+                if await el.is_visible():
+                    await el.scroll_into_view_if_needed()
+                    await page.wait_for_timeout(300)
+                    await el.click()
+                    await page.wait_for_timeout(500)
+                    
+                    # Click option with highest Y coordinate (in dropdown menu)
+                    opt = page.get_by_text("Osobna iskaznica")
+                    best_idx = -1
+                    best_y = -1
+                    for j in range(await opt.count()):
+                        o = opt.nth(j)
+                        if await o.is_visible():
+                            box = await o.bounding_box()
+                            if box and box['y'] > best_y:
+                                best_y = box['y']
+                                best_idx = j
+                    
+                    if best_idx >= 0:
+                        await opt.nth(best_idx).click()
+                        clicked = True
+                        filled += 1
+                        logger.debug(f"Guest {guest_index+1}: Selected doc type (idx={best_idx}, y={best_y:.0f})")
+                    break
+            
+            if not clicked:
+                logger.warning(f"Guest {guest_index+1}: Could not select doc type")
+            
+            await page.wait_for_timeout(300)
         except Exception as e:
-            logger.warning(f"Could not select document type: {e}")
+            logger.warning(f"Guest {guest_index+1}: Could not select document type: {e}")
         
         # 5. Fill BROJ DOKUMENTA (Document Number)
         doc_number = guest_data.get('documentNumber', '')
         if doc_number:
             try:
-                doc_input = page.locator('input[placeholder="Unesite broj dokumenta"]').first
+                doc_input = doc_inputs.nth(guest_index)
                 if await doc_input.count() > 0:
                     await doc_input.clear()
                     await doc_input.fill(doc_number)
                     filled += 1
-                    logger.debug(f"Filled document number: {doc_number}")
+                    logger.debug(f"Guest {guest_index+1}: Filled document number: {doc_number}")
             except Exception as e:
-                logger.warning(f"Could not fill document number: {e}")
+                logger.warning(f"Guest {guest_index+1}: Could not fill document number: {e}")
         
         # 6. Fill MJESTO PREBIVALIŠTA (Place of Residence)
         residence = guest_data.get('placeOfResidence', '')
         if residence:
             try:
-                res_input = page.locator('input[placeholder="Unesite mjesto prebivališta"]').first
+                res_input = res_inputs.nth(guest_index)
                 if await res_input.count() > 0:
                     await res_input.clear()
                     await res_input.fill(residence.upper())
                     filled += 1
-                    logger.debug(f"Filled residence: {residence}")
+                    logger.debug(f"Guest {guest_index+1}: Filled residence: {residence}")
             except Exception as e:
-                logger.warning(f"Could not fill residence: {e}")
+                logger.warning(f"Guest {guest_index+1}: Could not fill residence: {e}")
         
-        # 7. Select DRŽAVA ROĐENJA (Country of Birth) - searchable dropdown
+        # 7. Select DRŽAVA ROĐENJA (Country of Birth) - use nth(guest_index) directly
+        # Country inputs keep their placeholder even after selection, so nth() works
         nationality = guest_data.get('nationality', '')
         if nationality:
             try:
-                country_input = page.locator('input[placeholder="-- odaberite državu rođenja --"]').first
+                country_inputs = page.locator('input[placeholder="-- odaberite državu rođenja --"]')
+                country_input = country_inputs.nth(guest_index)
+                
                 if await country_input.count() > 0 and await country_input.is_visible():
-                    # Get search term and full display name
-                    search_term, display_name = self._get_country_search_term(nationality)
+                    logger.debug(f"Guest {guest_index+1}: Using country input at index {guest_index}")
+                    await country_input.scroll_into_view_if_needed()
+                    await page.wait_for_timeout(300)
                     await country_input.click()
                     await page.wait_for_timeout(300)
+                    
+                    search_term, display_name = self._get_country_search_term(nationality)
                     await country_input.fill(search_term)
                     await page.wait_for_timeout(800)
                     
-                    # Click on the dropdown option (not just Enter)
-                    country_option = page.get_by_text(display_name)
-                    if await country_option.count() > 0:
-                        await country_option.first.click()
-                        filled += 1
-                        logger.debug(f"Selected country: {display_name}")
-                    else:
-                        # Fallback: use arrow down + enter
-                        await page.keyboard.press("ArrowDown")
-                        await page.wait_for_timeout(200)
-                        await page.keyboard.press("Enter")
-                        filled += 1
-                        logger.debug(f"Selected country via keyboard: {nationality}")
+                    # Click first visible matching option
+                    options = page.get_by_text(display_name)
+                    for j in range(await options.count()):
+                        opt = options.nth(j)
+                        if await opt.is_visible():
+                            await opt.click()
+                            filled += 1
+                            logger.debug(f"Guest {guest_index+1}: Selected country: {display_name}")
+                            break
                 else:
-                    logger.warning("Country input not found or not visible")
+                    logger.warning(f"Guest {guest_index+1}: Country input at index {guest_index} not found or not visible")
             except Exception as e:
-                logger.warning(f"Could not select country: {e}")
+                logger.warning(f"Guest {guest_index+1}: Could not select country: {e}")
         
-        # 8. Click "Spremi goste" button to submit
-        submit_success = False
+        logger.info(f"Guest {guest_index+1}: Filled {filled} fields")
+        return filled
+    
+    async def _click_submit(self, page: Page) -> bool:
+        """Click the submit button after all guests are filled"""
         try:
-            # Scroll to bottom to find the submit button
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(500)
             
-            # Use exact text match - reliable and doesn't depend on auto-generated classes
             submit_button = page.get_by_text("Spremi goste", exact=True)
             
             if await submit_button.count() > 0:
@@ -267,23 +345,21 @@ class FormFillerService:
                 await page.wait_for_timeout(300)
                 await submit_button.click(force=True)
                 logger.info("Clicked Spremi goste button")
-                # Wait for form to submit
                 await page.wait_for_timeout(2000)
                 
-                # Check for validation error
                 error_msg = page.locator('text="Obrazac ima pogreške, molimo provjerite obrazac."')
                 if await error_msg.count() > 0:
                     logger.warning("Form validation error - some fields may be invalid")
+                    return False
                 else:
-                    submit_success = True
                     logger.info("Form submitted successfully!")
+                    return True
             else:
                 logger.warning("Spremi goste button not found")
+                return False
         except Exception as e:
             logger.warning(f"Could not click submit button: {e}")
-        
-        logger.info(f"Filled {filled} form fields")
-        return filled
+            return False
     
     def _get_country_search_term(self, nationality: str) -> tuple[str, str]:
         """Convert nationality to (search_term, display_name) for dropdown selection"""
