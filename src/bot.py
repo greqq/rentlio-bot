@@ -33,6 +33,7 @@ from src.config import config
 from src.services.rentlio_api import RentlioAPI, RentlioAPIError
 from src.services.ocr_service import ocr_service, ExtractedGuestData
 from src.services.form_filler import form_filler
+from src.services.database import db, ProcessedGuest
 
 # Setup logging
 logging.basicConfig(
@@ -310,16 +311,83 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔍 Search - Pretraži gosta\n\n"
         "**Check-in:**\n"
         "📷 Pošalji sliku osobne iskaznice\n"
-        "🔗 Bot će izvući podatke i tražiti URL\n"
-        "✅ Ispunit će formu automatski\n",
+        "🔗 Bot će izvući podatke i prikazati goste\n"
+        "👆 Odaberi gosta → automatski check-in\n\n"
+        "**Database:**\n"
+        "/pending - Rezervacije koje čekaju check-in\n"
+        "/dbstats - Statistika baze podataka\n",
         parse_mode="Markdown"
     )
+
+
+async def pending_checkins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show pending check-ins from database"""
+    try:
+        pending = db.get_pending_checkins()
+        
+        if not pending:
+            await update.message.reply_text(
+                "📭 **Nema rezervacija koje čekaju check-in**\n\n"
+                "Webhook će automatski spremiti nove rezervacije.\n"
+                "Ili koristi /upcoming za API podatke.",
+                parse_mode="Markdown"
+            )
+            return
+        
+        text = f"📋 **Rezervacije za check-in** ({len(pending)})\n"
+        text += "─" * 30
+        
+        for res in pending:
+            arrival = res.arrival_date.strftime('%d.%m.%Y') if res.arrival_date else 'N/A'
+            has_url = "🔗" if res.checkin_url else "❌"
+            
+            text += f"\n\n{has_url} **{res.guest_name}**\n"
+            text += f"🏠 {res.unit_name}\n"
+            text += f"📅 {arrival}\n"
+            text += f"👥 {res.adults}{f'+{res.children}' if res.children else ''} | {res.channel or 'Direct'}"
+            
+            if res.guest_phone:
+                text += f"\n📞 {res.guest_phone}"
+        
+        await update.message.reply_text(text, parse_mode="Markdown")
+        
+    except Exception as e:
+        logger.error(f"Error getting pending check-ins: {e}")
+        await update.message.reply_text(f"❌ Greška: {str(e)}")
+
+
+async def db_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show database statistics"""
+    try:
+        stats = db.get_stats()
+        
+        text = "📊 **Statistika baze podataka**\n"
+        text += "─" * 30 + "\n\n"
+        text += f"📅 Ukupno rezervacija: **{stats.get('total_reservations', 0)}**\n"
+        text += f"⏳ Čeka check-in: **{stats.get('pending_checkins', 0)}**\n"
+        text += f"🔗 S check-in URL: **{stats.get('with_checkin_url', 0)}**\n"
+        text += f"👤 Obrađenih gostiju: **{stats.get('processed_guests', 0)}**\n"
+        text += f"🎣 Webhook događaja: **{stats.get('webhook_events', 0)}**\n"
+        
+        await update.message.reply_text(text, parse_mode="Markdown")
+        
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        await update.message.reply_text(f"❌ Greška: {str(e)}")
 
 
 # ========== Photo / Check-in Flow ==========
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle ID photo for OCR extraction"""
+    """
+    Handle ID photo for OCR extraction.
+    
+    NEW FLOW:
+    1. Extract guest data from ID photo
+    2. Save to database as ProcessedGuest
+    3. Show list of pending check-ins from database
+    4. User selects reservation → bot auto-fills form
+    """
     await update.message.reply_text("🔍 Procesiram sliku...")
     
     try:
@@ -336,51 +404,100 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Delete the photo message for privacy
         try:
             await update.message.delete()
-            await update.message.reply_text("🗑️ _Slika obrisana iz sigurnosnih razloga_", parse_mode="Markdown")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="🗑️ _Slika obrisana iz sigurnosnih razloga_",
+                parse_mode="Markdown"
+            )
         except Exception as e:
             logger.warning(f"Could not delete photo: {e}")
         
         if not guest_data.is_valid():
-            await update.message.reply_text(
-                "❌ **Nisam uspio izvući podatke**\n\n"
-                f"Raw text:\n```\n{guest_data.raw_text[:500]}```\n\n"
-                "Pokušaj s boljom slikom (fokus, osvjetljenje).",
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="❌ **Nisam uspio izvući podatke**\n\n"
+                     f"Raw text:\n```\n{guest_data.raw_text[:500] if guest_data.raw_text else 'N/A'}```\n\n"
+                     "Pokušaj s boljom slikom (fokus, osvjetljenje).",
                 parse_mode="Markdown"
             )
             return
         
-        # Initialize guests list if needed
+        # Save guest to database
+        processed_guest = ProcessedGuest(
+            id=None,
+            reservation_id=None,
+            full_name=guest_data.full_name or f"{guest_data.first_name or ''} {guest_data.last_name or ''}".strip(),
+            first_name=guest_data.first_name,
+            last_name=guest_data.last_name,
+            date_of_birth=guest_data.date_of_birth,
+            gender=guest_data.gender,
+            nationality=guest_data.nationality,
+            document_type=guest_data.document_type,
+            document_number=guest_data.document_number,
+            document_expiry=guest_data.expiry_date,
+            place_of_residence=None,
+            raw_ocr_data=guest_data.raw_text,
+            created_at=datetime.now()
+        )
+        guest_id = db.add_processed_guest(processed_guest)
+        
+        # Store in context for later
         if 'guests' not in context.user_data:
             context.user_data['guests'] = []
         
-        # Add this guest to the list
-        context.user_data['guests'].append(guest_data.to_dict())
+        guest_dict = guest_data.to_dict()
+        guest_dict['db_id'] = guest_id
+        context.user_data['guests'].append(guest_dict)
         guest_count = len(context.user_data['guests'])
         
-        # Create keyboard to add another or proceed
-        keyboard = [
-            [
-                InlineKeyboardButton("➕ Dodaj još gosta", callback_data="add_another_guest"),
-            ],
-            [
-                InlineKeyboardButton("✅ Nastavi s URL-om", callback_data="proceed_to_url"),
-                InlineKeyboardButton("❌ Odustani", callback_data="cancel_checkin")
-            ]
-        ]
+        # Get pending check-ins from database
+        pending_checkins = db.get_pending_checkins()
+        
+        # Build response with extracted data
+        response_text = f"{guest_data.format_telegram()}\n\n"
+        response_text += f"✅ **Gost {guest_count} spreman!**\n"
+        response_text += f"👥 Ukupno gostiju: {guest_count}\n"
+        response_text += "─" * 25
+        
+        # Build keyboard
+        keyboard = []
+        
+        if pending_checkins:
+            response_text += f"\n\n📋 **Odaberi rezervaciju** ({len(pending_checkins)} čekaju check-in):\n"
+            
+            for res in pending_checkins[:8]:  # Limit to 8 buttons
+                arrival = res.arrival_date.strftime('%d.%m') if res.arrival_date else ''
+                btn_text = f"👤 {res.guest_name[:20]} | {res.unit_name[:15]} ({arrival})"
+                keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"select_res:{res.id}")])
+        else:
+            response_text += "\n\n📭 Nema rezervacija u bazi. Možeš:\n"
+            response_text += "• Poslati URL ručno\n"
+            response_text += "• Sačekati da webhook primi rezervaciju"
+        
+        # Add more options
+        keyboard.append([
+            InlineKeyboardButton("➕ Dodaj još gosta", callback_data="add_another_guest"),
+        ])
+        keyboard.append([
+            InlineKeyboardButton("🔗 Unesi URL ručno", callback_data="proceed_to_url"),
+            InlineKeyboardButton("❌ Odustani", callback_data="cancel_checkin")
+        ])
+        
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await update.message.reply_text(
-            f"{guest_data.format_telegram()}\n\n"
-            f"✅ **Gost {guest_count} dodan!**\n\n"
-            f"👥 Ukupno gostiju: {guest_count}\n\n"
-            "Dodaj još gosta ili nastavi s check-in URL-om?",
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=response_text,
             parse_mode="Markdown",
             reply_markup=reply_markup
         )
         
     except Exception as e:
         logger.error(f"Photo processing error: {e}")
-        await update.message.reply_text(f"❌ Greška: {str(e)}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"❌ Greška: {str(e)}"
+        )
 
 
 async def handle_checkin_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -443,6 +560,60 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline button callbacks"""
     query = update.callback_query
     await query.answer()
+    
+    # Handle reservation selection from database
+    if query.data.startswith("select_res:"):
+        reservation_id = query.data.split(":")[1]
+        
+        # Get reservation from database
+        reservation = db.get_reservation(reservation_id)
+        
+        if not reservation:
+            await query.edit_message_text("❌ Rezervacija nije pronađena u bazi.")
+            return
+        
+        if not reservation.checkin_url:
+            await query.edit_message_text(
+                f"❌ Rezervacija {reservation.guest_name} nema check-in URL.\n\n"
+                "Možeš unijeti URL ručno ili sačekati da webhook primi podatke."
+            )
+            return
+        
+        # Store reservation data
+        context.user_data['checkin_url'] = reservation.checkin_url
+        context.user_data['selected_reservation_id'] = reservation_id
+        
+        guests = context.user_data.get('guests', [])
+        
+        # Build confirmation message
+        arrival = reservation.arrival_date.strftime('%d.%m.%Y') if reservation.arrival_date else 'N/A'
+        departure = reservation.departure_date.strftime('%d.%m.%Y') if reservation.departure_date else 'N/A'
+        
+        guest_summary = ""
+        for i, guest in enumerate(guests, 1):
+            guest_summary += f"\n👤 **Gost {i}:** {guest.get('fullName', 'N/A')} ({guest.get('documentNumber', 'N/A')})"
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Ispuni formu", callback_data="fill_form"),
+                InlineKeyboardButton("❌ Odustani", callback_data="cancel_checkin")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"🎯 **Odabrana rezervacija:**\n\n"
+            f"👤 {reservation.guest_name}\n"
+            f"🏠 {reservation.unit_name}\n"
+            f"📅 {arrival} → {departure}\n"
+            f"👥 {reservation.adults} odraslih{f' + {reservation.children} djece' if reservation.children else ''}\n"
+            f"📱 {reservation.channel or 'Direct'}\n"
+            f"\n**Gosti za prijavu:**{guest_summary}\n\n"
+            f"Želiš da ispunim check-in formu?",
+            parse_mode="Markdown",
+            reply_markup=reply_markup
+        )
+        return
     
     if query.data == "cancel_checkin":
         context.user_data.clear()
@@ -595,6 +766,8 @@ async def setup_bot_commands(app: Application):
         BotCommand("today", "Današnji dolasci"),
         BotCommand("tomorrow", "Sutrašnji dolasci"),
         BotCommand("search", "Pretraži po imenu gosta"),
+        BotCommand("pending", "Čekaju check-in (iz baze)"),
+        BotCommand("dbstats", "Statistika baze"),
         BotCommand("notifications", "Uključi/isključi notifikacije"),
         BotCommand("help", "Pomoć"),
     ]
@@ -736,6 +909,8 @@ def main():
     app.add_handler(CommandHandler("search", search_guest))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("notifications", toggle_notifications))
+    app.add_handler(CommandHandler("pending", pending_checkins_command))
+    app.add_handler(CommandHandler("dbstats", db_stats_command))
     
     # Handle photo messages (for OCR)
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
