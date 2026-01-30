@@ -4,6 +4,7 @@ Rentlio Telegram Bot
 
 Features:
 - /start - Welcome message
+- /checkin - NEW API-based check-in (no form filling!)
 - /upcoming - Get reservations arriving in next 7 days
 - /today - Get today's arrivals
 - /tomorrow - Get tomorrow's arrivals
@@ -15,6 +16,7 @@ import logging
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta, time
+from typing import Optional
 
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -32,7 +34,7 @@ from telegram.ext import (
 from src.config import config
 from src.services.rentlio_api import RentlioAPI, RentlioAPIError
 from src.services.ocr_service import ocr_service, ExtractedGuestData
-from src.services.form_filler import form_filler
+from src.services.country_mapper import country_mapper
 
 # Setup logging
 logging.basicConfig(
@@ -99,9 +101,8 @@ def format_reservation(res: dict, detailed: bool = False) -> str:
 
 
 # ========== Conversation States ==========
-STATE_WAITING_FOR_URL = "waiting_for_url"
-STATE_WAITING_FOR_ANOTHER_GUEST = "waiting_for_another_guest"
-STATE_WAITING_FOR_INVOICE_CONFIRM = "waiting_for_invoice"
+STATE_CHECKIN_WAITING_FOR_PHOTO = "checkin_waiting_for_photo"
+STATE_CHECKIN_SELECTING_RESERVATION = "checkin_selecting_reservation"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -116,13 +117,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🏠 **Rentlio Bot**\n\n"
         "Dobrodošli! Odaberi opciju iz menija ispod 👇\n\n"
+        "**📷 Check-in:**\n"
+        "Samo pošalji slike osobnih iskaznica!\n"
+        "Bot automatski prepozna goste i ponudi check-in.\n\n"
         "**Komande:**\n"
         "/upcoming - Rezervacije sljedećih 7 dana\n"
         "/today - Današnji dolasci\n"
         "/tomorrow - Sutrašnji dolasci\n"
-        "/search <ime> - Pretraži po imenu gosta\n\n"
-        "**Check-in:**\n"
-        "📷 Pošalji sliku osobne iskaznice za OCR\n",
+        "/search <ime> - Pretraži po imenu gosta\n",
         parse_mode="Markdown",
         reply_markup=reply_markup
     )
@@ -303,23 +305,59 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show help"""
     await update.message.reply_text(
         "📖 **Pomoć**\n\n"
+        "**📷 Check-in:**\n"
+        "1️⃣ Pošalji slike osobnih iskaznica\n"
+        "2️⃣ Odaberi rezervaciju\n"
+        "3️⃣ Gosti se dodaju direktno u Rentlio!\n\n"
         "**Rezervacije:**\n"
         "📅 Upcoming - Sljedećih 7 dana\n"
         "🌅 Today - Današnji dolasci\n"
         "🌄 Tomorrow - Sutrašnji dolasci\n"
         "🔍 Search - Pretraži gosta\n\n"
-        "**Check-in:**\n"
-        "📷 Pošalji sliku osobne iskaznice\n"
-        "🔗 Bot će izvući podatke i tražiti URL\n"
-        "✅ Ispunit će formu automatski\n",
+        "**Računi:**\n"
+        "/invoice <id> - Upravljaj računima\n",
         parse_mode="Markdown"
     )
 
 
-# ========== Photo / Check-in Flow ==========
+# ========== NEW API-Based Check-in Flow ==========
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle ID photo for OCR extraction"""
+async def checkin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start the new API-based check-in flow"""
+    # Clear any previous state
+    context.user_data.clear()
+    
+    # Initialize check-in session
+    context.user_data['checkin_guests'] = []
+    context.user_data['state'] = STATE_CHECKIN_WAITING_FOR_PHOTO
+    
+    # Load countries if not loaded
+    await country_mapper.load_countries(api)
+    
+    await update.message.reply_text(
+        "🛎️ **API Check-in**\n\n"
+        "📷 Pošalji slike osobnih iskaznica/putovnica.\n\n"
+        "Podržano:\n"
+        "• 🇭🇷 Hrvatske osobne iskaznice\n"
+        "• 🌍 Putovnice s MRZ zonom\n"
+        "• 🪪 EU osobne iskaznice\n\n"
+        "Možeš poslati više slika za više gostiju.\n"
+        "Kada završiš, klikni **Nastavi** 👇",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Nastavi s odabirom rezervacije", callback_data="checkin_select_reservation")],
+            [InlineKeyboardButton("❌ Odustani", callback_data="checkin_cancel")]
+        ])
+    )
+
+
+async def handle_checkin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photo in new check-in flow"""
+    state = context.user_data.get('state')
+    
+    if state != STATE_CHECKIN_WAITING_FOR_PHOTO:
+        return False  # Not in check-in flow
+    
     await update.message.reply_text("🔍 Procesiram sliku...")
     
     try:
@@ -336,107 +374,461 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Delete the photo message for privacy
         try:
             await update.message.delete()
-            await update.message.reply_text("🗑️ _Slika obrisana iz sigurnosnih razloga_", parse_mode="Markdown")
+            await context.bot.send_message(
+                chat_id=update.message.chat_id,
+                text="🗑️ _Slika obrisana iz sigurnosnih razloga_",
+                parse_mode="Markdown"
+            )
         except Exception as e:
             logger.warning(f"Could not delete photo: {e}")
         
         if not guest_data.is_valid():
-            await update.message.reply_text(
-                "❌ **Nisam uspio izvući podatke**\n\n"
-                f"Raw text:\n```\n{guest_data.raw_text[:500]}```\n\n"
-                "Pokušaj s boljom slikom (fokus, osvjetljenje).",
+            await context.bot.send_message(
+                chat_id=update.message.chat_id,
+                text="❌ **Nisam uspio izvući podatke**\n\n"
+                     f"Pokušaj s boljom slikom (fokus, osvjetljenje).\n\n"
+                     f"Raw text:\n```\n{guest_data.raw_text[:300]}...```",
+                parse_mode="Markdown"
+            )
+            return True
+        
+        # Add to guests list
+        context.user_data['checkin_guests'].append(guest_data)
+        guest_count = len(context.user_data['checkin_guests'])
+        
+        await context.bot.send_message(
+            chat_id=update.message.chat_id,
+            text=f"{guest_data.format_telegram()}\n\n"
+                 f"✅ **Gost {guest_count} dodan!**\n\n"
+                 f"📷 Pošalji još slika ili klikni **Nastavi** 👇",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"✅ Nastavi ({guest_count} gost/a)", callback_data="checkin_select_reservation")],
+                [InlineKeyboardButton("❌ Odustani", callback_data="checkin_cancel")]
+            ])
+        )
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Check-in photo processing error: {e}")
+        await context.bot.send_message(
+            chat_id=update.message.chat_id,
+            text=f"❌ Greška: {str(e)}"
+        )
+        return True
+
+
+async def show_reservation_selection(query, context):
+    """Show upcoming reservations for check-in"""
+    guests = context.user_data.get('checkin_guests', [])
+    
+    if not guests:
+        await query.edit_message_text(
+            "⚠️ Nema gostiju za check-in.\n\n"
+            "Koristi /checkin za početak i pošalji slike osobnih."
+        )
+        context.user_data.clear()
+        return
+    
+    await query.edit_message_text("⏳ Dohvaćam nadolazeće rezervacije...")
+    
+    try:
+        # Fetch upcoming reservations (today + next 5 days)
+        today = datetime.now().strftime("%Y-%m-%d")
+        future = (datetime.now() + timedelta(days=5)).strftime("%Y-%m-%d")
+        
+        reservations = await api.get_reservations(
+            date_from=today,
+            date_to=future,
+            limit=20
+        )
+        
+        if not reservations:
+            await query.edit_message_text(
+                "📭 Nema rezervacija u sljedećih 5 dana.\n\n"
+                "Provjeri datume rezervacija u Rentlio sustavu."
+            )
+            context.user_data.clear()
+            return
+        
+        # Sort by arrival date
+        reservations.sort(key=lambda x: x.get("arrivalDate", 0))
+        
+        # Store reservations for later use
+        context.user_data['checkin_reservations'] = {str(r['id']): r for r in reservations}
+        context.user_data['state'] = STATE_CHECKIN_SELECTING_RESERVATION
+        
+        # Build keyboard with reservation options (max 6)
+        keyboard = []
+        for res in reservations[:6]:
+            res_id = str(res.get('id', ''))
+            guest_name = res.get('guestName', 'N/A')[:15]
+            unit_name = res.get('unitName', '')[:10]
+            arrival = format_date(res.get('arrivalDate', 0))
+            nights = res.get('totalNights', 0)
+            checked_in = "✅" if res.get('checkedIn') == 'Y' else "⏳"
+            
+            btn_text = f"{checked_in} {guest_name} | {unit_name} | {arrival}"
+            keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"checkin_res_{res_id}")])
+        
+        keyboard.append([InlineKeyboardButton("❌ Odustani", callback_data="checkin_cancel")])
+        
+        # Guest summary
+        guest_summary = ""
+        for i, guest in enumerate(guests, 1):
+            name = guest.full_name or f"{guest.first_name} {guest.last_name}".strip()
+            guest_summary += f"\n👤 Gost {i}: **{name}**"
+            if guest.nationality:
+                guest_summary += f" ({guest.nationality})"
+        
+        await query.edit_message_text(
+            f"🛎️ **API Check-in**\n\n"
+            f"**Gosti za prijavu:**{guest_summary}\n\n"
+            f"**Odaberi rezervaciju:**\n"
+            f"_(rezervacije sljedećih 5 dana)_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+    except RentlioAPIError as e:
+        await query.edit_message_text(f"❌ API Greška: {e.message}")
+        context.user_data.clear()
+    except Exception as e:
+        logger.error(f"Fetch reservations error: {e}")
+        await query.edit_message_text(f"❌ Greška: {str(e)}")
+        context.user_data.clear()
+
+
+def convert_date_to_timestamp(date_str: str) -> Optional[str]:
+    """Convert DD.MM.YYYY to Unix timestamp string"""
+    if not date_str:
+        return None
+    
+    try:
+        # Try DD.MM.YYYY format
+        dt = datetime.strptime(date_str, "%d.%m.%Y")
+        return str(int(dt.timestamp()))
+    except ValueError:
+        pass
+    
+    try:
+        # Try YYYY-MM-DD format
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return str(int(dt.timestamp()))
+    except ValueError:
+        pass
+    
+    return None
+
+
+def convert_gender_to_id(gender: str) -> Optional[int]:
+    """Convert M/F to Rentlio gender ID (1=Female, 2=Male)"""
+    if not gender:
+        return None
+    
+    g = gender.upper().strip()
+    if g in ('M', 'MALE', 'MUŠKO', 'MUSKI'):
+        return 2
+    elif g in ('F', 'FEMALE', 'ŽENSKO', 'ZENSKO', 'ŽENSKI'):
+        return 1
+    return None
+
+
+async def perform_api_checkin(query, context, reservation_id: str):
+    """Perform the actual API check-in"""
+    guests = context.user_data.get('checkin_guests', [])
+    reservations = context.user_data.get('checkin_reservations', {})
+    reservation_data = reservations.get(reservation_id, {})
+    
+    if not guests:
+        await query.edit_message_text("⚠️ Nema gostiju za prijavu.")
+        context.user_data.clear()
+        return
+    
+    await query.edit_message_text(
+        f"⏳ Prijavljujem {len(guests)} gost(a) na rezervaciju #{reservation_id}..."
+    )
+    
+    try:
+        # Convert OCR data to API format
+        api_guests = []
+        for i, guest in enumerate(guests):
+            # Build full name
+            name = guest.full_name
+            if not name and (guest.first_name or guest.last_name):
+                name = f"{guest.first_name or ''} {guest.last_name or ''}".strip()
+            
+            if not name:
+                name = f"Gost {i + 1}"
+            
+            # Get country ID
+            country_id = None
+            if guest.nationality:
+                country_id = country_mapper.get_country_id(guest.nationality)
+            
+            # Build guest object
+            api_guest = {
+                "name": name,
+                "isBooker": "N",
+                "isPrimary": "Y" if i == 0 else "N",  # First guest is primary
+                "isAdditional": "N" if i == 0 else "Y",  # Others are additional
+            }
+            
+            # Add optional fields if available
+            if guest.date_of_birth:
+                ts = convert_date_to_timestamp(guest.date_of_birth)
+                if ts:
+                    api_guest["dateOfBirth"] = ts
+            
+            if guest.gender:
+                gender_id = convert_gender_to_id(guest.gender)
+                if gender_id:
+                    api_guest["genderId"] = gender_id
+            
+            if country_id:
+                api_guest["countryId"] = country_id
+                api_guest["citizenshipCountryId"] = country_id
+            
+            if guest.document_number:
+                # Store in note field since there's no direct field
+                api_guest["note"] = f"Doc: {guest.document_number}"
+            
+            if guest.place_of_residence:
+                api_guest["cityOfResidence"] = guest.place_of_residence
+            
+            api_guests.append(api_guest)
+        
+        # Call API to add guests
+        result = await api.add_reservation_guests(reservation_id, api_guests)
+        
+        # Check result
+        added = result.get('guestAdded', [])
+        messages = result.get('messages', [])
+        
+        # Build success message
+        guest_name = reservation_data.get('guestName', 'N/A')
+        unit_name = reservation_data.get('unitName', 'N/A')
+        arrival = format_date(reservation_data.get('arrivalDate', 0))
+        departure = format_date(reservation_data.get('departureDate', 0))
+        
+        # Guest summary
+        guest_summary = ""
+        for i, guest in enumerate(guests):
+            name = guest.full_name or f"{guest.first_name} {guest.last_name}".strip()
+            country = guest.nationality or "N/A"
+            success = "✅" if (i < len(added)) else "⚠️"
+            guest_summary += f"\n{success} {name} ({country})"
+        
+        # Check if all added successfully
+        if len(added) == len(guests):
+            status_text = "✅ **Check-in uspješan!**"
+        elif added:
+            status_text = "⚠️ **Djelomično uspješno**"
+        else:
+            status_text = "❌ **Check-in nije uspio**"
+        
+        # Show any messages from API
+        msg_text = ""
+        if messages:
+            msg_text = "\n\n📝 API poruke:\n" + "\n".join(f"• {m[:100]}" for m in messages[:3])
+        
+        await query.edit_message_text(
+            f"{status_text}\n\n"
+            f"📋 Rezervacija: #{reservation_id}\n"
+            f"👤 Booker: {guest_name}\n"
+            f"🏠 {unit_name}\n"
+            f"📅 {arrival} → {departure}\n\n"
+            f"**Prijavljeni gosti:**{guest_summary}"
+            f"{msg_text}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧾 Generiraj račun", callback_data=f"checkin_invoice_{reservation_id}")],
+                [InlineKeyboardButton("✅ Gotovo", callback_data="checkin_done")]
+            ])
+        )
+        
+        # Store for potential invoice generation
+        context.user_data['checkin_completed_reservation'] = reservation_id
+        context.user_data['checkin_completed_reservation_data'] = reservation_data
+        
+    except RentlioAPIError as e:
+        logger.error(f"API Check-in error: {e.message}, data: {e.response_data}")
+        await query.edit_message_text(
+            f"❌ **API Greška**\n\n"
+            f"{e.message}\n\n"
+            f"Pokušaj ponovo ili koristi Rentlio UI za ručni unos."
+        )
+        context.user_data.clear()
+    except Exception as e:
+        logger.error(f"Check-in error: {e}")
+        await query.edit_message_text(f"❌ Greška: {str(e)}")
+        context.user_data.clear()
+
+
+# ========== Photo / Check-in Flow ==========
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle ID photo - automatically starts API check-in flow"""
+    
+    # Initialize check-in session if not already in one
+    if 'checkin_guests' not in context.user_data:
+        context.user_data['checkin_guests'] = []
+        # Load countries on first photo
+        await country_mapper.load_countries(api)
+    
+    await update.message.reply_text("🔍 Procesiram sliku...")
+    
+    try:
+        # Get the largest photo
+        photo = update.message.photo[-1]
+        
+        # Download photo to memory
+        file = await context.bot.get_file(photo.file_id)
+        image_bytes = await file.download_as_bytearray()
+        
+        # Extract data with OCR
+        guest_data = await ocr_service.extract_from_bytes(bytes(image_bytes))
+        
+        # Delete the photo message for privacy
+        try:
+            await update.message.delete()
+            await context.bot.send_message(
+                chat_id=update.message.chat_id,
+                text="🗑️ _Slika obrisana iz sigurnosnih razloga_",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.warning(f"Could not delete photo: {e}")
+        
+        if not guest_data.is_valid():
+            await context.bot.send_message(
+                chat_id=update.message.chat_id,
+                text="❌ **Nisam uspio izvući podatke**\n\n"
+                     f"Pokušaj s boljom slikom (fokus, osvjetljenje).\n\n"
+                     f"Raw text:\n```\n{guest_data.raw_text[:300]}...```",
                 parse_mode="Markdown"
             )
             return
         
-        # Initialize guests list if needed
-        if 'guests' not in context.user_data:
-            context.user_data['guests'] = []
+        # Add guest to check-in list (using ExtractedGuestData object directly)
+        context.user_data['checkin_guests'].append(guest_data)
+        guest_count = len(context.user_data['checkin_guests'])
         
-        # Add this guest to the list
-        context.user_data['guests'].append(guest_data.to_dict())
-        guest_count = len(context.user_data['guests'])
-        
-        # Create keyboard to add another or proceed
-        keyboard = [
-            [
-                InlineKeyboardButton("➕ Dodaj još gosta", callback_data="add_another_guest"),
-            ],
-            [
-                InlineKeyboardButton("✅ Nastavi s URL-om", callback_data="proceed_to_url"),
-                InlineKeyboardButton("❌ Odustani", callback_data="cancel_checkin")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            f"{guest_data.format_telegram()}\n\n"
-            f"✅ **Gost {guest_count} dodan!**\n\n"
-            f"👥 Ukupno gostiju: {guest_count}\n\n"
-            "Dodaj još gosta ili nastavi s check-in URL-om?",
+        # Show extracted data and offer to continue or proceed
+        await context.bot.send_message(
+            chat_id=update.message.chat_id,
+            text=f"{guest_data.format_telegram()}\n\n"
+                 f"✅ **Gost {guest_count} dodan!**\n\n"
+                 f"📷 Pošalji još slika ili klikni **Nastavi** 👇",
             parse_mode="Markdown",
-            reply_markup=reply_markup
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"✅ Nastavi ({guest_count} gost/a)", callback_data="checkin_select_reservation")],
+                [InlineKeyboardButton("❌ Odustani", callback_data="checkin_cancel")]
+            ])
         )
         
     except Exception as e:
         logger.error(f"Photo processing error: {e}")
-        await update.message.reply_text(f"❌ Greška: {str(e)}")
+        await context.bot.send_message(
+            chat_id=update.message.chat_id,
+            text=f"❌ Greška: {str(e)}"
+        )
 
 
-async def handle_checkin_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle check-in URL after photo was processed"""
-    text = update.message.text.strip()
+async def create_invoice_for_reservation(query, context, reservation_id: str, guest: dict, reservation_data: dict = None):
+    """Create invoice for a reservation with guest info"""
+    guest_name = guest.get('fullName', 'Gost')
+    country = guest.get('nationality', guest.get('country', 'N/A'))
+    today = datetime.now().strftime("%d.%m.%Y")
     
-    # Check if it's a valid check-in URL (support both short and full format)
-    # Short: ci.book.rentl.io/c/{uuid}/{code}
-    # Full: sun-apartments.book.rentl.io/reservation/check-in/{uuid}
-    is_short_url = 'ci.book.rentl.io' in text
-    is_full_url = 'book.rentl.io' in text and 'check-in' in text
-    
-    if not (is_short_url or is_full_url):
-        return False  # Not a check-in URL, let other handlers process it
-    
-    # Check if we're expecting a URL
-    if context.user_data.get('state') != STATE_WAITING_FOR_URL:
-        await update.message.reply_text(
-            "⚠️ Prvo pošalji sliku osobne iskaznice, pa onda URL."
-        )
-        return True
-    
-    guests = context.user_data.get('guests', [])
-    if not guests:
-        await update.message.reply_text(
-            "⚠️ Nema podataka o gostu. Pošalji prvo sliku osobne."
-        )
-        return True
-    
-    # Store URL (form_filler will transform if needed)
-    context.user_data['checkin_url'] = text
-    context.user_data['state'] = None
-    
-    # Build guest summary
-    guest_summary = ""
-    for i, guest in enumerate(guests, 1):
-        guest_summary += f"\n👤 **Gost {i}:** {guest.get('fullName', 'N/A')} ({guest.get('documentNumber', 'N/A')})"
-    
-    # Show confirmation
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Ispuni formu", callback_data="fill_form"),
-            InlineKeyboardButton("❌ Odustani", callback_data="cancel_checkin")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        f"🔗 **URL primljen!**\n"
-        f"{guest_summary}\n\n"
-        f"👥 Ukupno: {len(guests)} gost(a)\n\n"
-        f"Želiš da ispunim check-in formu?",
-        parse_mode="Markdown",
-        reply_markup=reply_markup
+    await query.edit_message_text(
+        f"⏳ Kreiram račun za rezervaciju #{reservation_id}..."
     )
-    return True
+    
+    try:
+        # Get reservation details
+        if reservation_data:
+            unit_name = reservation_data.get('unitName', 'Smještaj')
+            price_per_night = reservation_data.get('pricePerNight', 60)
+            total_nights = reservation_data.get('totalNights', 1)
+            arrival_ts = reservation_data.get('arrivalDate', 0)
+            departure_ts = reservation_data.get('departureDate', 0)
+            
+            # Format dates (dd.mm.)
+            if arrival_ts:
+                arrival_dt = datetime.fromtimestamp(arrival_ts)
+                arrival_str = arrival_dt.strftime("%d.%m.")
+            else:
+                arrival_str = today[:6]
+            
+            if departure_ts:
+                departure_dt = datetime.fromtimestamp(departure_ts)
+                departure_str = departure_dt.strftime("%d.%m.")
+            else:
+                departure_str = today[:6]
+            
+            # Determine payment type based on channel
+            channel = reservation_data.get('otaChannelName', '').lower()
+            sales_channel = reservation_data.get('salesChannelName', '').lower()
+            origin = reservation_data.get('origin', 0)
+            
+            # origin: 1 = manual, 2+ = channel booking
+            # Check if it's from Booking.com, Airbnb, or other OTA
+            is_ota = ('booking' in channel or 'airbnb' in channel or 
+                      'booking' in sales_channel or 'airbnb' in sales_channel or
+                      origin > 1)
+            
+            payment_type = "Transakcijski račun" if is_ota else "Gotovina"
+        else:
+            unit_name = "Smještaj"
+            price_per_night = 60
+            total_nights = 1
+            arrival_str = today[:6]
+            departure_str = today[:6]
+            payment_type = "Gotovina"
+        
+        # Format description like: "Smještaj Sunset (19.01. - 22.01.)"
+        description = f"Smještaj {unit_name} ({arrival_str} - {departure_str})"
+        
+        result = await api.add_invoice_item(
+            reservation_id=reservation_id,
+            description=description,
+            price=price_per_night,
+            quantity=total_nights,
+            discount_percent=0,
+            vat_included="Y",
+            taxes=[{"label": "PDV", "rate": 13}]
+        )
+        
+        if result:
+            item_total = price_per_night * total_nights
+            await query.edit_message_text(
+                f"✅ **Račun kreiran!**\n\n"
+                f"📋 Rezervacija: #{reservation_id}\n"
+                f"👤 Gost: **{guest_name}**\n"
+                f"🌍 Država: {country}\n"
+                f"🏠 {description}\n"
+                f"💰 {price_per_night:.2f}€ x {total_nights} noći = **{item_total:.2f}€**\n"
+                f"💳 Plaćanje: {payment_type}\n"
+                f"📅 Datum: {today}\n\n"
+                f"⚠️ _Račun je kreiran kao DRAFT._\n"
+                f"_Zaključi ga ručno u Rentlio sustavu (Izdaj račun)._",
+                parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text(
+                f"⚠️ Račun možda nije kreiran. Provjeri u Rentlio sustavu."
+            )
+        
+    except RentlioAPIError as e:
+        logger.error(f"Invoice API error: {e.message}, data: {e.response_data}")
+        await query.edit_message_text(f"❌ API Greška: {e.message}")
+    except Exception as e:
+        logger.error(f"Invoice creation error: {e}")
+        await query.edit_message_text(f"❌ Greška: {str(e)}")
+    
+    context.user_data.clear()
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -444,111 +836,127 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    if query.data == "cancel_checkin":
+    # ========== NEW API Check-in Callbacks ==========
+    
+    if query.data == "checkin_cancel":
         context.user_data.clear()
         await query.edit_message_text("❌ Check-in otkazan.")
+        return
     
-    elif query.data == "add_another_guest":
-        # User wants to add another guest - set state and wait for photo
-        context.user_data['state'] = STATE_WAITING_FOR_ANOTHER_GUEST
-        guest_count = len(context.user_data.get('guests', []))
-        await query.edit_message_text(
-            f"👥 Ukupno gostiju: {guest_count}\n\n"
-            f"📷 Pošalji sliku osobne iskaznice za **Gosta {guest_count + 1}**",
-            parse_mode="Markdown"
-        )
+    elif query.data == "checkin_select_reservation":
+        await show_reservation_selection(query, context)
+        return
     
-    elif query.data == "proceed_to_url":
-        # User done adding guests, proceed to URL
-        context.user_data['state'] = STATE_WAITING_FOR_URL
-        guests = context.user_data.get('guests', [])
+    elif query.data.startswith("checkin_res_"):
+        reservation_id = query.data.replace("checkin_res_", "")
+        await perform_api_checkin(query, context, reservation_id)
+        return
+    
+    elif query.data.startswith("checkin_invoice_"):
+        reservation_id = query.data.replace("checkin_invoice_", "")
+        guests = context.user_data.get('checkin_guests', [])
+        reservation_data = context.user_data.get('checkin_completed_reservation_data', {})
         
-        # Build guest summary
-        guest_summary = ""
-        for i, guest in enumerate(guests, 1):
-            guest_summary += f"\n👤 Gost {i}: {guest.get('fullName', 'N/A')}"
-        
-        await query.edit_message_text(
-            f"✅ **{len(guests)} gost(a) spremno!**\n"
-            f"{guest_summary}\n\n"
-            f"📎 Sada pošalji **check-in URL** link:\n"
-            f"`https://sun-apartments.book.rentl.io/reservation/check-in/...`",
-            parse_mode="Markdown"
-        )
-        
-    elif query.data == "fill_form":
-        checkin_url = context.user_data.get('checkin_url')
-        guests = context.user_data.get('guests', [])
-        
-        if not checkin_url or not guests:
-            await query.edit_message_text("❌ Greška: nedostaju podaci.")
-            return
-        
-        await query.edit_message_text(f"⏳ Ispunjavam formu za {len(guests)} gost(a)... (ovo može potrajati 10-30 sec)")
-        
-        try:
-            # Fill the form using Playwright - pass list of guests
-            result = await form_filler.fill_form(checkin_url, guests)
-            
-            if result.success:
-                # Send screenshot of filled form
-                if result.screenshot:
-                    await context.bot.send_photo(
-                        chat_id=query.message.chat_id,
-                        photo=result.screenshot,
-                        caption=f"✅ **Forma ispunjena za {len(guests)} gost(a)!**",
-                        parse_mode="Markdown"
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id=query.message.chat_id,
-                        text=f"✅ Forma ispunjena!\n\n{result.message}",
-                        parse_mode="Markdown"
-                    )
-                
-                # Ask about invoice
-                keyboard = [
-                    [
-                        InlineKeyboardButton("✅ Da, generiraj", callback_data="generate_invoice"),
-                        InlineKeyboardButton("❌ Ne", callback_data="skip_invoice")
-                    ]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text="🧾 Želiš generirati račun?",
-                    reply_markup=reply_markup
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=f"❌ **Greška pri ispunjavanju forme:**\n\n{result.message}\n\n"
-                         f"Pokušaj ručno ispuniti formu:\n{checkin_url}",
-                    parse_mode="Markdown"
-                )
-                context.user_data.clear()
-                
-        except Exception as e:
-            logger.error(f"Form filling error: {e}")
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=f"❌ Greška: {str(e)}\n\nPokušaj ručno: {checkin_url}"
-            )
+        if guests:
+            # Convert first guest to invoice format
+            first_guest = guests[0]
+            guest_dict = {
+                'fullName': first_guest.full_name or f"{first_guest.first_name} {first_guest.last_name}".strip(),
+                'nationality': first_guest.nationality or 'N/A'
+            }
+            await create_invoice_for_reservation(query, context, reservation_id, guest_dict, reservation_data)
+        else:
+            await query.edit_message_text("⚠️ Nema podataka o gostima za račun.")
             context.user_data.clear()
-        
-    elif query.data == "generate_invoice":
-        await query.edit_message_text("🧾 Generiranje računa... (TODO)")
-        # TODO: Call Rentlio API to generate invoice
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text="✅ Račun generiran! (placeholder)\n\n_Invoice API integration coming soon_",
-            parse_mode="Markdown"
+        return
+    
+    elif query.data == "checkin_done":
+        await query.edit_message_text(
+            "✅ **Check-in završen!**\n\n"
+            "Gosti su prijavljeni u Rentlio sustav.\n"
+            "Provjeri podatke u Rentlio aplikaciji."
         )
         context.user_data.clear()
-        
-    elif query.data == "skip_invoice":
+        return
+    
+    # ========== Invoice Callbacks ==========
+    
+    if query.data == "skip_invoice":
         await query.edit_message_text("👍 OK, bez računa.")
+        context.user_data.clear()
+    
+    # Invoice callbacks
+    elif query.data.startswith("add_item_"):
+        reservation_id = query.data.replace("add_item_", "")
+        context.user_data['invoice_reservation_id'] = reservation_id
+        context.user_data['state'] = 'waiting_for_invoice_item'
+        
+        await query.edit_message_text(
+            f"➕ **Dodaj stavku na račun**\n\n"
+            f"Rezervacija: #{reservation_id}\n\n"
+            f"Upiši stavku u formatu:\n"
+            f"`naziv, cijena, količina`\n\n"
+            f"Primjeri:\n"
+            f"• `Boravišna pristojba, 1.35, 4`\n"
+            f"• `Parking, 10, 3`\n"
+            f"• `Doručak, 8, 2`\n\n"
+            f"Ili upiši samo `/cancel` za odustajanje.",
+            parse_mode="Markdown"
+        )
+    
+    elif query.data.startswith("invoice_details_"):
+        invoice_id = query.data.replace("invoice_details_", "")
+        
+        try:
+            invoice = await api.get_invoice_details(invoice_id)
+            
+            text = f"📋 **Račun #{invoice_id}**\n"
+            text += f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            
+            # Status
+            status_code = invoice.get("status", 1)
+            status_names = {1: "📝 Draft", 2: "📄 Issued", 3: "✅ Fiscalised"}
+            text += f"Status: {status_names.get(status_code, 'Unknown')}\n"
+            text += f"Datum: {format_date(invoice.get('date', 0))}\n\n"
+            
+            # Items
+            items = invoice.get("items", [])
+            if items:
+                text += "**Stavke:**\n"
+                for item in items:
+                    desc = item.get("description", "N/A")
+                    price = item.get("price", 0)
+                    qty = item.get("quantity", 1)
+                    total = item.get("totalPrice", price * qty)
+                    text += f"• {desc}\n"
+                    text += f"  {price:.2f} x {qty} = {total:.2f} EUR\n"
+            
+            # Totals
+            text += f"\n━━━━━━━━━━━━━━━━━━━━\n"
+            text += f"**Ukupno: {invoice.get('totalValue', 0):.2f} EUR**\n"
+            
+            # Taxes
+            taxes = invoice.get("taxes", [])
+            if taxes:
+                text += "\nPorezi:\n"
+                for tax in taxes:
+                    text += f"• {tax.get('label', 'PDV')} ({tax.get('rate', 0)}%): {tax.get('value', 0):.2f} EUR\n"
+            
+            await query.edit_message_text(text, parse_mode="Markdown")
+            
+        except RentlioAPIError as e:
+            await query.edit_message_text(f"❌ Greška: {e.message}")
+        except Exception as e:
+            logger.error(f"Invoice details error: {e}")
+            await query.edit_message_text(f"❌ Greška: {str(e)}")
+    
+    elif query.data == "invoice_done":
+        await query.edit_message_text(
+            "✅ **Račun spremljen!**\n\n"
+            "Račun je u draft statusu u Rentlio sustavu.\n"
+            "Možeš ga pregledati i izdati u Rentlio web aplikaciji.",
+            parse_mode="Markdown"
+        )
         context.user_data.clear()
 
 
@@ -556,11 +964,156 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Handle text messages - check if it's a URL or menu button"""
     text = update.message.text
     
-    # Check if it's a check-in URL (short or full format)
-    if 'ci.book.rentl.io' in text or ('book.rentl.io' in text and 'check-in' in text):
-        handled = await handle_checkin_url(update, context)
-        if handled:
+    # Check for cancel command
+    if text.lower() == '/cancel':
+        context.user_data.clear()
+        await update.message.reply_text("❌ Akcija otkazana.")
+        return
+    
+    # Check if waiting for invoice item input
+    if context.user_data.get('state') == 'waiting_for_invoice_item':
+        reservation_id = context.user_data.get('invoice_reservation_id')
+        
+        try:
+            # Parse input: "description, price, quantity"
+            parts = [p.strip() for p in text.split(',')]
+            
+            if len(parts) < 2:
+                await update.message.reply_text(
+                    "⚠️ Format: `naziv, cijena, količina`\n\n"
+                    "Primjer: `Parking, 10, 3`\n\n"
+                    "Ili `/cancel` za odustajanje.",
+                    parse_mode="Markdown"
+                )
+                return
+            
+            description = parts[0]
+            price = float(parts[1])
+            quantity = float(parts[2]) if len(parts) > 2 else 1
+            
+            await update.message.reply_text(f"⏳ Dodajem stavku na račun...")
+            
+            # Add item to invoice
+            result = await api.add_invoice_item(
+                reservation_id=reservation_id,
+                description=description,
+                price=price,
+                quantity=quantity,
+                vat_included="Y",
+                taxes=[{"label": "PDV", "rate": 25}]  # Default 25% VAT
+            )
+            
+            item_total = result.get("totalPrice", price * quantity)
+            
+            # Offer to add more or done
+            keyboard = [
+                [InlineKeyboardButton("➕ Dodaj još", callback_data=f"add_item_{reservation_id}")],
+                [InlineKeyboardButton("✅ Gotovo", callback_data="invoice_done")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                f"✅ **Stavka dodana!**\n\n"
+                f"📦 {description}\n"
+                f"💰 {price:.2f} x {quantity} = {item_total:.2f} EUR\n\n"
+                f"Dodaj još ili završi:",
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+            
+            context.user_data.pop('state', None)
+            
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Neispravan format. Cijena mora biti broj.\n\n"
+                "Primjer: `Parking, 10, 3`",
+                parse_mode="Markdown"
+            )
+        except RentlioAPIError as e:
+            await update.message.reply_text(f"❌ API Greška: {e.message}")
+            context.user_data.clear()
+        except Exception as e:
+            logger.error(f"Add invoice item error: {e}")
+            await update.message.reply_text(f"❌ Greška: {str(e)}")
+            context.user_data.clear()
+        return
+    
+    # Check if waiting for reservation ID for invoice after check-in
+    if context.user_data.get('state') == 'waiting_for_invoice_reservation_id':
+        reservation_id = text.strip()
+        
+        if not reservation_id.isdigit():
+            await update.message.reply_text(
+                "⚠️ Reservation ID mora biti broj.\n\n"
+                "Primjer: `12345`\n\n"
+                "`/cancel` za odustajanje."
+            )
             return
+        
+        # Get selected guest info
+        selected_guest = context.user_data.get('invoice_selected_guest', {})
+        guest_name = selected_guest.get('fullName', 'N/A')
+        guest_country = selected_guest.get('nationality', selected_guest.get('country', 'N/A'))
+        today_date = datetime.now().strftime("%d.%m.%Y")
+        
+        await update.message.reply_text(f"⏳ Kreiram račun za rezervaciju #{reservation_id}...")
+        
+        try:
+            # Get reservation details for pricing
+            reservation = await api.get_reservation_details(reservation_id)
+            total_price = reservation.get("totalPrice", 0)
+            nights = reservation.get("totalNights", 1)
+            unit_name = reservation.get("unitName", "Smještaj")
+            
+            # Calculate dates for description
+            arrival = format_date(reservation.get("arrivalDate", 0))
+            departure = format_date(reservation.get("departureDate", 0))
+            
+            # Add accommodation as invoice item with guest info in description
+            result = await api.add_invoice_item(
+                reservation_id=reservation_id,
+                description=f"Smještaj u {unit_name} ({arrival} - {departure})",
+                price=total_price,
+                quantity=1,
+                vat_included="Y",  # Price includes VAT
+                taxes=[{"label": "PDV", "rate": 13}]  # 13% VAT for accommodation in Croatia
+            )
+            
+            item_total = result.get("totalPrice", total_price)
+            
+            # Offer to add more items
+            keyboard = [
+                [InlineKeyboardButton("➕ Dodaj stavku", callback_data=f"add_item_{reservation_id}")],
+                [InlineKeyboardButton("✅ Gotovo", callback_data="invoice_done")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                f"✅ **Račun kreiran!**\n\n"
+                f"👤 Gost: **{guest_name}**\n"
+                f"🌍 Država: {guest_country}\n"
+                f"📅 Datum: {today_date}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📋 Smještaj u {unit_name}\n"
+                f"🗓 {arrival} - {departure} ({nights} noći)\n"
+                f"💰 Ukupno: {item_total:.2f} EUR\n\n"
+                f"_Račun je u statusu 'Draft'_\n\n"
+                f"Želiš dodati još stavki?",
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+            
+            # Store for potential additional items
+            context.user_data['invoice_reservation_id'] = reservation_id
+            
+        except RentlioAPIError as e:
+            await update.message.reply_text(f"❌ API Greška: {e.message}")
+            context.user_data.clear()
+        except Exception as e:
+            logger.error(f"Invoice creation error: {e}")
+            await update.message.reply_text(f"❌ Greška: {str(e)}")
+            context.user_data.clear()
+        return
     
     # Check if it's a menu button
     if any(emoji in text for emoji in ['📅', '🌅', '🌄', '🔍', '❓']):
@@ -591,66 +1144,82 @@ async def setup_bot_commands(app: Application):
     """Set up bot commands menu in Telegram"""
     commands = [
         BotCommand("start", "Pokreni bota"),
+        BotCommand("checkin", "🆕 API Check-in (bez forme!)"),
         BotCommand("upcoming", "Rezervacije sljedećih 7 dana"),
         BotCommand("today", "Današnji dolasci"),
         BotCommand("tomorrow", "Sutrašnji dolasci"),
         BotCommand("search", "Pretraži po imenu gosta"),
+        BotCommand("invoice", "Upravljanje računima"),
         BotCommand("notifications", "Uključi/isključi notifikacije"),
         BotCommand("help", "Pomoć"),
     ]
     await app.bot.set_my_commands(commands)
 
 
-async def get_daily_summary() -> tuple[list, list]:
-    """Get today's arrivals and departures"""
+async def get_daily_summary() -> tuple[list, list, list]:
+    """Get today's arrivals, departures, and tomorrow's arrivals"""
     today = datetime.now()
+    tomorrow = today + timedelta(days=1)
+    
     today_str = today.strftime("%Y-%m-%d")
+    tomorrow_str = tomorrow.strftime("%Y-%m-%d")
+    
     today_ts_start = int(today.replace(hour=0, minute=0, second=0).timestamp())
     today_ts_end = int(today.replace(hour=23, minute=59, second=59).timestamp())
+    tomorrow_ts_start = int(tomorrow.replace(hour=0, minute=0, second=0).timestamp())
+    tomorrow_ts_end = int(tomorrow.replace(hour=23, minute=59, second=59).timestamp())
     
-    # Get reservations for today
+    # Get reservations for today and tomorrow
     reservations = await api.get_reservations(
         date_from=today_str,
-        date_to=today_str,
+        date_to=tomorrow_str,
         limit=50
     )
     
     arrivals = []
     departures = []
+    tomorrow_arrivals = []
     
     for res in reservations:
         arrival_ts = res.get("arrivalDate", 0)
         departure_ts = res.get("departureDate", 0)
         
+        # Today's arrivals
         if today_ts_start <= arrival_ts <= today_ts_end:
             arrivals.append(res)
+        # Today's departures
         if today_ts_start <= departure_ts <= today_ts_end:
             departures.append(res)
+        # Tomorrow's arrivals (for reminder)
+        if tomorrow_ts_start <= arrival_ts <= tomorrow_ts_end:
+            tomorrow_arrivals.append(res)
     
-    return arrivals, departures
+    return arrivals, departures, tomorrow_arrivals
 
 
 async def send_daily_notification(context: ContextTypes.DEFAULT_TYPE):
-    """Send daily check-in/check-out notification"""
+    """Send daily check-in/check-out notification with tomorrow's reminder"""
     logger.info("Checking for daily arrivals/departures...")
     
     try:
-        arrivals, departures = await get_daily_summary()
+        arrivals, departures, tomorrow_arrivals = await get_daily_summary()
         
-        # Skip if nothing happening today
-        if not arrivals and not departures:
-            logger.info("No arrivals or departures today - skipping notification")
+        # Skip if nothing happening today AND tomorrow
+        if not arrivals and not departures and not tomorrow_arrivals:
+            logger.info("No arrivals or departures - skipping notification")
             return
         
-        today_str = datetime.now().strftime("%d.%m.%Y")
+        today = datetime.now()
+        today_str = today.strftime("%d.%m.%Y")
+        tomorrow_str = (today + timedelta(days=1)).strftime("%d.%m.%Y")
         
         # Build message
         text = f"🌅 **Dnevni pregled - {today_str}**\n"
         text += "─" * 30 + "\n"
         
-        # Arrivals
+        # Today's Arrivals (CHECK-IN)
         if arrivals:
-            text += f"\n🟢 **DOLASCI ({len(arrivals)})**\n"
+            text += f"\n🟢 **DOLASCI DANAS ({len(arrivals)})**\n"
             for res in arrivals:
                 guest = res.get("guestName", "Unknown")
                 unit = res.get("unitName", "")
@@ -660,13 +1229,29 @@ async def send_daily_notification(context: ContextTypes.DEFAULT_TYPE):
                 if phone:
                     text += f"  📞 {phone}\n"
         
-        # Departures
+        # Today's Departures (CHECK-OUT)
         if departures:
-            text += f"\n🔴 **ODLASCI ({len(departures)})**\n"
+            text += f"\n🔴 **ODLASCI DANAS ({len(departures)})**\n"
             for res in departures:
                 guest = res.get("guestName", "Unknown")
                 unit = res.get("unitName", "")
                 text += f"• {guest} ← {unit}\n"
+        
+        # Tomorrow's Arrivals (REMINDER - send instructions!)
+        if tomorrow_arrivals:
+            text += f"\n📅 **SUTRA DOLAZE ({len(tomorrow_arrivals)}) - {tomorrow_str}**\n"
+            text += "_⚠️ Pošalji upute gostima!_\n"
+            for res in tomorrow_arrivals:
+                guest = res.get("guestName", "Unknown")
+                unit = res.get("unitName", "")
+                phone = res.get("guestContactNumber", "")
+                nights = res.get("totalNights", 0)
+                email = res.get("guestContactEmail", "")
+                text += f"• {guest} → {unit} ({nights} noći)\n"
+                if phone:
+                    text += f"  📞 {phone}\n"
+                if email:
+                    text += f"  ✉️ {email}\n"
         
         # Send to all allowed users
         for user_id in config.TELEGRAM_ALLOWED_USERS:
@@ -705,6 +1290,95 @@ async def toggle_notifications(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+# ========== Invoice Commands ==========
+
+async def invoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    View or manage invoices for a reservation
+    Usage: /invoice <reservation_id>
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "📋 **Upravljanje računima**\n\n"
+            "Korištenje: `/invoice <reservation_id>`\n\n"
+            "Primjer: `/invoice 12345`\n\n"
+            "Možeš pronaći reservation ID:\n"
+            "• U detaljima rezervacije\n"
+            "• Koristi /search pa klikni na rezervaciju",
+            parse_mode="Markdown"
+        )
+        return
+    
+    reservation_id = context.args[0]
+    
+    await update.message.reply_text(f"⏳ Dohvaćam račune za rezervaciju {reservation_id}...")
+    
+    try:
+        # Get reservation details first
+        reservation = await api.get_reservation_details(reservation_id)
+        guest_name = reservation.get("holder", {}).get("name", "N/A")
+        unit_name = reservation.get("unitName", "N/A")
+        
+        # Get invoices for this reservation
+        invoices = await api.get_reservation_invoices(reservation_id)
+        
+        if not invoices:
+            # No invoices yet - offer to create one
+            keyboard = [
+                [InlineKeyboardButton("➕ Dodaj stavku", callback_data=f"add_item_{reservation_id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                f"🧾 **Rezervacija #{reservation_id}**\n"
+                f"👤 {guest_name}\n"
+                f"🏠 {unit_name}\n\n"
+                f"📭 Nema računa za ovu rezervaciju.\n\n"
+                f"Klikni dolje za dodavanje stavke (kreira se draft račun automatski).",
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+        else:
+            # Show existing invoices
+            text = f"🧾 **Računi za rezervaciju #{reservation_id}**\n"
+            text += f"👤 {guest_name} | 🏠 {unit_name}\n\n"
+            
+            for inv in invoices:
+                inv_id = inv.get("id", "N/A")
+                inv_date = format_date(inv.get("date", 0))
+                status = inv.get("status", {})
+                status_name = status.get("name", "Draft") if isinstance(status, dict) else "Draft"
+                total = inv.get("totalValue", 0)
+                
+                status_emoji = {
+                    "Draft": "📝",
+                    "Issued": "📄",
+                    "Fiscalised": "✅"
+                }.get(status_name, "📋")
+                
+                text += f"{status_emoji} **Račun #{inv_id}**\n"
+                text += f"   📅 {inv_date} | {status_name}\n"
+                text += f"   💰 {total:.2f} EUR\n\n"
+            
+            keyboard = [
+                [InlineKeyboardButton("➕ Dodaj stavku", callback_data=f"add_item_{reservation_id}")],
+                [InlineKeyboardButton("📋 Detalji računa", callback_data=f"invoice_details_{invoices[0].get('id', '')}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+            
+    except RentlioAPIError as e:
+        await update.message.reply_text(f"❌ API Greška: {e.message}")
+    except Exception as e:
+        logger.error(f"Invoice command error: {e}")
+        await update.message.reply_text(f"❌ Greška: {str(e)}")
+
+
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors"""
     logger.error(f"Update {update} caused error {context.error}")
@@ -736,6 +1410,9 @@ def main():
     app.add_handler(CommandHandler("search", search_guest))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("notifications", toggle_notifications))
+    app.add_handler(CommandHandler("invoice", invoice_command))
+    app.add_handler(CommandHandler("checkin", checkin_command))  # NEW API check-in
+    app.add_handler(CommandHandler("cancel", lambda u, c: u.message.reply_text("❌ Akcija otkazana.") or c.user_data.clear()))
     
     # Handle photo messages (for OCR)
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
@@ -756,9 +1433,9 @@ def main():
     async def post_init(application: Application):
         await setup_bot_commands(application)
         
-        # Schedule daily notification
-        if config.TELEGRAM_ALLOWED_USERS:
-            job_queue = application.job_queue
+        # Schedule daily notification (if job_queue is available)
+        job_queue = application.job_queue
+        if job_queue and config.TELEGRAM_ALLOWED_USERS:
             job_queue.run_daily(
                 send_daily_notification,
                 time=NOTIFICATION_TIME,
@@ -766,6 +1443,8 @@ def main():
             )
             print(f"📅 Daily notifications scheduled for {NOTIFICATION_TIME.strftime('%H:%M')}")
             print(f"👤 Notifying users: {config.TELEGRAM_ALLOWED_USERS}")
+        elif not job_queue:
+            print("⚠️  JobQueue not available - install with: pip install 'python-telegram-bot[job-queue]'")
         else:
             print("⚠️  No TELEGRAM_ALLOWED_USERS set - notifications disabled")
             print("   Use /notifications in the bot to get your user ID")
