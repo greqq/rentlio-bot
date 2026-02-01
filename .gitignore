@@ -31,6 +31,7 @@ logs/
 # Google Cloud credentials
 *-credentials.json
 service-account*.json
+google-cloud-vision.json
 
 # Playwright
 playwright-report/

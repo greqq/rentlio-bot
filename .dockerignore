@@ -1,0 +1,45 @@
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+venv/
+env/
+
+# Git
+.git/
+.gitignore
+
+# Environment files
+.env
+.env.*
+
+# Credentials (NEVER copy to Docker image!)
+credentials/
+*.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Documentation
+*.md
+architecture.md
+online-checkin-form-analysis.md
+rentlio-api-analysis.md
+
+# Scripts (development only)
+scripts/
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# CI/CD
+.github/

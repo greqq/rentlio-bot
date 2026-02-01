@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  rentlio-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rentlio-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Mount Google Cloud credentials (read-only)
+      - ./credentials:/app/credentials:ro
+    environment:
+      # Override to use mounted credentials path
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/google-cloud-vision.json
+      - TZ=Europe/Zagreb
