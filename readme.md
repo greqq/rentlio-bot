@@ -48,85 +48,10 @@ A Python-based Telegram bot designed to automate the guest check-in process and 
 TELEGRAM_BOT_TOKEN=your_token
 RENTLIO_API_KEY=your_key
 GOOGLE_APPLICATION_CREDENTIALS=path_to_json
-TELEGRAM_ALLOWED_USERS=123456789  # For notifications
+TELEGRAM_ALLOWED_USERS=123456789  # For notificationsTELEGRAM_ALLOWED_USERS=123456789  # For notifications
 ```
 
-## Docker Deployment (Recommended 🐳)
-
-### Prerequisites
-- Docker & Docker Compose installed
-- GitHub account (for Container Registry)
-
-### 1. Quick Setup on Raspberry Pi
-```bash
-# Clone and run automated setup
-git clone <your-repo-url> ~/rentlio-bot
-cd ~/rentlio-bot
-./deploy/raspberry-pi-setup.sh
-```
-
-The script will:
-- Install Docker if needed
-- Set up `.env` configuration
-- Login to GitHub Container Registry
-- Start the bot with auto-update enabled (Watchtower)
-
-### 2. Manual Setup
-```bash
-# Clone repository
-git clone <your-repo-url> ~/rentlio-bot
-cd ~/rentlio-bot
-
-# Create credentials directory and add Google Cloud JSON
-mkdir -p credentials
-# Copy your google-cloud-vision.json here
-
-# Configure environment
-cp .env.example .env
-nano .env  # Add your tokens/keys
-
-# Login to GitHub Container Registry
-docker login ghcr.io -u YOUR_GITHUB_USERNAME
-
-# Start containers
-docker-compose up -d
-```
-
-### 3. CI/CD Pipeline
-Every push to `main` automatically:
-1. 🏗️ Builds multi-arch Docker image (amd64, arm64, arm/v7)
-2. 📦 Pushes to GitHub Container Registry
-3. 🔄 Watchtower on Raspberry Pi pulls & restarts (within 5 min)
-
-**Setup GitHub Container Registry:**
-1. Go to Settings → Developer Settings → Personal Access Tokens
-2. Create token with `write:packages` permission
-3. On Raspberry Pi: `docker login ghcr.io -u YOUR_USERNAME`
-
-### 4. Commands
-```bash
-# View logs
-docker-compose logs -f rentlio-bot
-
-# Check status
-docker-compose ps
-
-# Restart bot
-docker-compose restart rentlio-bot
-
-# Stop everything
-docker-compose down
-
-# Update manually (Watchtower does this automatically)
-docker-compose pull && docker-compose up -d
-```
-
----
-
-## Traditional Deployment (Python venv)
-
-<details>
-<summary>Click to expand non-Docker deployment</summary>
+## Raspberry Pi Deployment
 
 ### 1. Clone & Setup
 ```bash
@@ -152,10 +77,24 @@ nano .env
 # Set GOOGLE_APPLICATION_CREDENTIALS to point to it
 ```
 
-### 3. Run
+### 3. Install as Service
 ```bash
-source venv/bin/activate
-python -m src.bot
+# Copy service file
+sudo cp rentlio-bot.service /etc/systemd/system/
+
+# Edit if your user isn't 'pi' or path is different
+sudo nano /etc/systemd/system/rentlio-bot.service
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable rentlio-bot
+sudo systemctl start rentlio-bot
+
+# Check status
+sudo systemctl status rentlio-bot
+
+# View logs
+journalctl -u rentlio-bot -f
 ```
 
 ### 4. Update
@@ -164,6 +103,5 @@ cd ~/rentlio-bot
 git pull
 source venv/bin/activate
 pip install -r requirements.txt
+sudo systemctl restart rentlio-bot
 ```
-
-</details>

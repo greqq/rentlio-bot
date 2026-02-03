@@ -131,35 +131,62 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def upcoming_reservations(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get reservations for next 7 days"""
-    await update.message.reply_text("🔍 Dohvaćam rezervacije...")
+    """Get reservations arriving in next 7 days"""
+    await update.message.reply_text("🔍 Dohvaćam dolaske u sljedećih 7 dana...")
     
     try:
         # Get dates
-        today = datetime.now().strftime("%Y-%m-%d")
-        week_later = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+        today = datetime.now()
+        week_later = today + timedelta(days=7)
+        
+        today_str = today.strftime("%Y-%m-%d")
+        week_str = week_later.strftime("%Y-%m-%d")
+        
+        today_ts = int(today.replace(hour=0, minute=0, second=0).timestamp())
+        week_ts = int(week_later.replace(hour=23, minute=59, second=59).timestamp())
         
         # Fetch reservations
-        reservations = await api.get_reservations(
-            date_from=today,
-            date_to=week_later,
-            limit=20
+        all_reservations = await api.get_reservations(
+            date_from=today_str,
+            date_to=week_str,
+            limit=50
         )
         
-        if not reservations:
-            await update.message.reply_text("📭 Nema rezervacija u sljedećih 7 dana.")
+        # Filter to only confirmed reservations (status=1) and arrivals in next 7 days
+        CONFIRMED_STATUS = 1
+        arrivals = [r for r in all_reservations 
+                   if r.get("status") == CONFIRMED_STATUS and today_ts <= r.get("arrivalDate", 0) <= week_ts]
+        
+        if not arrivals:
+            await update.message.reply_text("📭 Nema dolazaka u sljedećih 7 dana.")
             return
         
         # Sort by arrival date
-        reservations.sort(key=lambda x: x.get("arrivalDate", 0))
+        arrivals.sort(key=lambda x: x.get("arrivalDate", 0))
         
-        # Group by date
-        text = f"📅 **Rezervacije {today} - {week_later}**\n"
-        text += f"Ukupno: {len(reservations)} rezervacija\n"
-        text += "─" * 30
+        # Build message grouped by unit
+        text = f"📅 **Dolasci - sljedećih 7 dana**\n"
+        text += f"Ukupno: {len(arrivals)} dolazaka\n\n"
         
-        for res in reservations:
-            text += "\n" + format_reservation(res) + "\n"
+        # Group by unit (apartment)
+        from collections import defaultdict
+        by_unit = defaultdict(list)
+        for res in arrivals:
+            unit = res.get("unitName", "Unknown")
+            by_unit[unit].append(res)
+        
+        for unit in sorted(by_unit.keys()):
+            text += f"🏠 **{unit}**\n"
+            # Sort by arrival date within unit
+            unit_arrivals = sorted(by_unit[unit], key=lambda x: x.get("arrivalDate", 0))
+            for res in unit_arrivals:
+                arrival_date = datetime.fromtimestamp(res.get("arrivalDate", 0)).strftime("%d.%m")
+                guest = res.get("guestName", "Unknown")
+                nights = res.get("totalNights", 0)
+                adults = res.get("adults", 0)
+                price = res.get("totalPrice", 0)
+                text += f"  • {arrival_date}: {guest} ({nights} {'noć' if nights == 1 else 'noći'}, {adults} os., {price:.0f}€)\n"
+            text += "\n"
         
         # Split message if too long
         if len(text) > 4000:
@@ -1170,29 +1197,46 @@ async def get_daily_summary() -> tuple[list, list, list]:
     tomorrow_ts_end = int(tomorrow.replace(hour=23, minute=59, second=59).timestamp())
     
     # Get reservations for today and tomorrow
-    reservations = await api.get_reservations(
+    # Note: Rentlio API returns reservations overlapping the date range
+    all_reservations = await api.get_reservations(
         date_from=today_str,
         date_to=tomorrow_str,
-        limit=50
+        limit=100
     )
+    
+    # Filter to only confirmed reservations (status=1)
+    # Status 5 = cancelled/blocked, we don't want those
+    CONFIRMED_STATUS = 1
+    all_reservations = [r for r in all_reservations if r.get("status") == CONFIRMED_STATUS]
     
     arrivals = []
     departures = []
     tomorrow_arrivals = []
     
-    for res in reservations:
+    # Use set to track reservation IDs and avoid duplicates
+    seen_arrival_ids = set()
+    seen_departure_ids = set()
+    seen_tomorrow_ids = set()
+    
+    for res in all_reservations:
         arrival_ts = res.get("arrivalDate", 0)
         departure_ts = res.get("departureDate", 0)
+        res_id = res.get("id")
         
-        # Today's arrivals
-        if today_ts_start <= arrival_ts <= today_ts_end:
+        # Today's arrivals - exact match on arrival date
+        if today_ts_start <= arrival_ts <= today_ts_end and res_id not in seen_arrival_ids:
             arrivals.append(res)
-        # Today's departures
-        if today_ts_start <= departure_ts <= today_ts_end:
+            seen_arrival_ids.add(res_id)
+        
+        # Today's departures - exact match on departure date
+        if today_ts_start <= departure_ts <= today_ts_end and res_id not in seen_departure_ids:
             departures.append(res)
-        # Tomorrow's arrivals (for reminder)
-        if tomorrow_ts_start <= arrival_ts <= tomorrow_ts_end:
+            seen_departure_ids.add(res_id)
+        
+        # Tomorrow's arrivals - exact match on arrival date
+        if tomorrow_ts_start <= arrival_ts <= tomorrow_ts_end and res_id not in seen_tomorrow_ids:
             tomorrow_arrivals.append(res)
+            seen_tomorrow_ids.add(res_id)
     
     return arrivals, departures, tomorrow_arrivals
 
@@ -1213,45 +1257,74 @@ async def send_daily_notification(context: ContextTypes.DEFAULT_TYPE):
         today_str = today.strftime("%d.%m.%Y")
         tomorrow_str = (today + timedelta(days=1)).strftime("%d.%m.%Y")
         
-        # Build message
-        text = f"🌅 **Dnevni pregled - {today_str}**\n"
-        text += "─" * 30 + "\n"
+        # Build message with cleaner format
+        text = f"🌅 **Dnevni pregled - {today_str}**\n\n"
+        
+        # Today's Departures (CHECK-OUT) - show first as they leave
+        if departures:
+            text += f"🔴 **ODLASCI DANAS ({len(departures)})**\n"
+            # Group by unit
+            by_unit = {}
+            for res in departures:
+                unit = res.get("unitName", "")
+                if unit not in by_unit:
+                    by_unit[unit] = []
+                by_unit[unit].append(res)
+            
+            for unit in sorted(by_unit.keys()):
+                for res in by_unit[unit]:
+                    guest = res.get("guestName", "Unknown")
+                    text += f"• {guest} ← {unit}\n"
+            text += "\n"
         
         # Today's Arrivals (CHECK-IN)
         if arrivals:
-            text += f"\n🟢 **DOLASCI DANAS ({len(arrivals)})**\n"
+            text += f"🟢 **DOLASCI DANAS ({len(arrivals)})**\n"
+            # Group by unit
+            by_unit = {}
             for res in arrivals:
-                guest = res.get("guestName", "Unknown")
                 unit = res.get("unitName", "")
-                phone = res.get("guestContactNumber", "")
-                nights = res.get("totalNights", 0)
-                text += f"• {guest} → {unit} ({nights} noći)\n"
-                if phone:
-                    text += f"  📞 {phone}\n"
-        
-        # Today's Departures (CHECK-OUT)
-        if departures:
-            text += f"\n🔴 **ODLASCI DANAS ({len(departures)})**\n"
-            for res in departures:
-                guest = res.get("guestName", "Unknown")
-                unit = res.get("unitName", "")
-                text += f"• {guest} ← {unit}\n"
+                if unit not in by_unit:
+                    by_unit[unit] = []
+                by_unit[unit].append(res)
+            
+            for unit in sorted(by_unit.keys()):
+                text += f"  🏠 _{unit}_\n"
+                for res in by_unit[unit]:
+                    guest = res.get("guestName", "Unknown")
+                    phone = res.get("guestContactNumber", "")
+                    nights = res.get("totalNights", 0)
+                    text += f"  • {guest} ({nights} {'noć' if nights == 1 else 'noći'})\n"
+                    if phone:
+                        text += f"    📞 {phone}\n"
+            text += "\n"
         
         # Tomorrow's Arrivals (REMINDER - send instructions!)
         if tomorrow_arrivals:
-            text += f"\n📅 **SUTRA DOLAZE ({len(tomorrow_arrivals)}) - {tomorrow_str}**\n"
-            text += "_⚠️ Pošalji upute gostima!_\n"
+            text += f"📅 **SUTRA DOLAZE ({len(tomorrow_arrivals)}) - {tomorrow_str}**\n"
+            text += "⚠️ _Pošalji upute gostima!_\n\n"
+            
+            # Group by unit
+            by_unit = {}
             for res in tomorrow_arrivals:
-                guest = res.get("guestName", "Unknown")
                 unit = res.get("unitName", "")
-                phone = res.get("guestContactNumber", "")
-                nights = res.get("totalNights", 0)
-                email = res.get("guestContactEmail", "")
-                text += f"• {guest} → {unit} ({nights} noći)\n"
-                if phone:
-                    text += f"  📞 {phone}\n"
-                if email:
-                    text += f"  ✉️ {email}\n"
+                if unit not in by_unit:
+                    by_unit[unit] = []
+                by_unit[unit].append(res)
+            
+            for unit in sorted(by_unit.keys()):
+                text += f"  🏠 _{unit}_\n"
+                for res in by_unit[unit]:
+                    guest = res.get("guestName", "Unknown")
+                    phone = res.get("guestContactNumber", "")
+                    nights = res.get("totalNights", 0)
+                    email = res.get("guestEmail", "")
+                    
+                    text += f"  • **{guest}** ({nights} {'noć' if nights == 1 else 'noći'})\n"
+                    if phone:
+                        text += f"    📞 {phone}\n"
+                    if email:
+                        text += f"    ✉️ {email}\n"
         
         # Send to all allowed users
         for user_id in config.TELEGRAM_ALLOWED_USERS:
