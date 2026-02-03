@@ -259,9 +259,175 @@ async def test_upcoming():
         await api.close()
 
 
+async def test_current_guests():
+    """Test the current guests logic"""
+    print("\n\n🧪 Testing current guests...\n")
+    
+    api = RentlioAPI()
+    
+    try:
+        today = datetime.now()
+        today_ts = int(today.timestamp())
+        
+        # Get reservations that overlap with today
+        week_ago = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+        week_later = (today + timedelta(days=7)).strftime("%Y-%m-%d")
+        
+        reservations = await api.get_reservations(
+            date_from=week_ago,
+            date_to=week_later,
+            limit=50
+        )
+        
+        # Filter to confirmed reservations currently staying
+        CONFIRMED_STATUS = 1
+        current = []
+        for r in reservations:
+            if r.get("status") != CONFIRMED_STATUS:
+                continue
+            arrival = r.get("arrivalDate", 0)
+            departure = r.get("departureDate", 0)
+            if arrival <= today_ts < departure:
+                current.append(r)
+        
+        print(f"🏠 Currently staying: {len(current)} guests\n")
+        
+        from collections import defaultdict
+        by_unit = defaultdict(list)
+        for res in current:
+            unit = res.get("unitName", "Unknown")
+            by_unit[unit].append(res)
+        
+        for unit in sorted(by_unit.keys()):
+            print(f"🏠 {unit}")
+            for res in by_unit[unit]:
+                guest = res.get("guestName", "Unknown")
+                departure = datetime.fromtimestamp(res.get("departureDate", 0))
+                days_left = (departure - today).days
+                checkout_str = departure.strftime("%d.%m")
+                
+                if days_left == 0:
+                    status = "🔴 odlazi danas"
+                elif days_left == 1:
+                    status = "🟡 odlazi sutra"
+                else:
+                    status = f"odlazi {checkout_str}"
+                
+                print(f"  • {guest} ({status})")
+            print()
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        await api.close()
+
+
+async def test_week_stats():
+    """Test the weekly statistics logic"""
+    print("\n\n📊 Testing weekly statistics...\n")
+    
+    api = RentlioAPI()
+    
+    try:
+        today = datetime.now()
+        start_of_week = today - timedelta(days=today.weekday())
+        end_of_week = start_of_week + timedelta(days=6)
+        
+        start_str = start_of_week.strftime("%Y-%m-%d")
+        end_str = end_of_week.strftime("%Y-%m-%d")
+        start_display = start_of_week.strftime("%d.%m")
+        end_display = end_of_week.strftime("%d.%m")
+        
+        start_ts = int(start_of_week.replace(hour=0, minute=0, second=0).timestamp())
+        end_ts = int(end_of_week.replace(hour=23, minute=59, second=59).timestamp())
+        
+        print(f"📅 Week: {start_display} - {end_display}\n")
+        
+        reservations = await api.get_reservations(
+            date_from=start_str,
+            date_to=end_str,
+            limit=100
+        )
+        
+        CONFIRMED_STATUS = 1
+        reservations = [r for r in reservations if r.get("status") == CONFIRMED_STATUS]
+        
+        from collections import defaultdict
+        unit_stats = defaultdict(lambda: {"nights": 0, "revenue": 0, "guests": []})
+        
+        for res in reservations:
+            unit = res.get("unitName", "Unknown")
+            arrival = res.get("arrivalDate", 0)
+            departure = res.get("departureDate", 0)
+            price = res.get("totalPrice", 0)
+            total_nights = res.get("totalNights", 1)
+            guest = res.get("guestName", "Unknown")
+            
+            res_start = max(arrival, start_ts)
+            res_end = min(departure, end_ts)
+            
+            if res_end > res_start:
+                nights_in_week = (res_end - res_start) // 86400
+                nights_in_week = max(1, nights_in_week)
+                
+                if total_nights > 0:
+                    revenue_per_night = price / total_nights
+                    week_revenue = revenue_per_night * nights_in_week
+                else:
+                    week_revenue = price
+                
+                unit_stats[unit]["nights"] += nights_in_week
+                unit_stats[unit]["revenue"] += week_revenue
+                unit_stats[unit]["guests"].append(guest)
+        
+        total_revenue = 0
+        total_nights = 0
+        total_possible = 0
+        
+        for unit in sorted(unit_stats.keys()):
+            stats = unit_stats[unit]
+            nights = stats["nights"]
+            revenue = stats["revenue"]
+            occupancy = (nights / 7) * 100
+            
+            total_revenue += revenue
+            total_nights += nights
+            total_possible += 7
+            
+            filled = int(occupancy / 10)
+            bar = "█" * filled + "░" * (10 - filled)
+            
+            print(f"🏠 {unit}")
+            print(f"   {bar} {occupancy:.0f}%")
+            print(f"   📅 {nights}/7 noći | 💰 {revenue:.0f}€")
+            if stats["guests"]:
+                print(f"   👥 {', '.join(stats['guests'][:3])}")
+            print()
+        
+        if total_possible > 0:
+            total_occupancy = (total_nights / total_possible) * 100
+        else:
+            total_occupancy = 0
+        
+        num_units = len(unit_stats)
+        print("─" * 30)
+        print(f"UKUPNO ({num_units} apartmana): 💰 {total_revenue:.0f}€ | 📈 {total_occupancy:.0f}% | 🛏️ {total_nights} noći")
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        await api.close()
+
+
 if __name__ == "__main__":
     print("=" * 50)
     print("RENTLIO BOT - NOTIFICATION TEST")
     print("=" * 50)
     asyncio.run(test_daily_notification())
     asyncio.run(test_upcoming())
+    asyncio.run(test_current_guests())
+    asyncio.run(test_week_stats())

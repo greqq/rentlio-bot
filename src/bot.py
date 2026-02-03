@@ -209,30 +209,49 @@ async def today_arrivals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Dohvaćam današnje dolaske...")
     
     try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        today_ts_start = int(datetime.now().replace(hour=0, minute=0, second=0).timestamp())
-        today_ts_end = int(datetime.now().replace(hour=23, minute=59, second=59).timestamp())
+        today = datetime.now()
+        today_str = today.strftime("%Y-%m-%d")
+        today_display = today.strftime("%d.%m.%Y")
+        today_ts_start = int(today.replace(hour=0, minute=0, second=0).timestamp())
+        today_ts_end = int(today.replace(hour=23, minute=59, second=59).timestamp())
         
         reservations = await api.get_reservations(
-            date_from=today,
-            date_to=today,
+            date_from=today_str,
+            date_to=today_str,
             limit=50
         )
         
-        # Filter to arrivals today only
+        # Filter to confirmed arrivals today only (status=1)
+        CONFIRMED_STATUS = 1
         arrivals = [r for r in reservations 
-                   if today_ts_start <= r.get("arrivalDate", 0) <= today_ts_end]
+                   if r.get("status") == CONFIRMED_STATUS and today_ts_start <= r.get("arrivalDate", 0) <= today_ts_end]
         
         if not arrivals:
-            await update.message.reply_text("📭 Nema dolazaka danas.")
+            await update.message.reply_text(f"📭 Nema dolazaka danas ({today_display}).")
             return
         
-        text = f"📅 **Dolasci danas ({today})**\n"
-        text += f"Ukupno: {len(arrivals)}\n"
-        text += "─" * 30
+        text = f"📅 **Dolasci danas - {today_display}**\n"
+        text += f"Ukupno: {len(arrivals)}\n\n"
         
+        # Group by unit
+        from collections import defaultdict
+        by_unit = defaultdict(list)
         for res in arrivals:
-            text += "\n" + format_reservation(res, detailed=True) + "\n"
+            unit = res.get("unitName", "Unknown")
+            by_unit[unit].append(res)
+        
+        for unit in sorted(by_unit.keys()):
+            text += f"🏠 **{unit}**\n"
+            for res in by_unit[unit]:
+                guest = res.get("guestName", "Unknown")
+                phone = res.get("guestContactNumber", "")
+                nights = res.get("totalNights", 0)
+                adults = res.get("adults", 0)
+                price = res.get("totalPrice", 0)
+                text += f"  • {guest} ({nights} {'noć' if nights == 1 else 'noći'}, {adults} os., {price:.0f}€)\n"
+                if phone:
+                    text += f"    📞 {phone}\n"
+            text += "\n"
         
         await update.message.reply_text(text, parse_mode="Markdown")
         
@@ -250,6 +269,7 @@ async def tomorrow_arrivals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tomorrow = (datetime.now() + timedelta(days=1))
         tomorrow_str = tomorrow.strftime("%Y-%m-%d")
+        tomorrow_display = tomorrow.strftime("%d.%m.%Y")
         tomorrow_ts_start = int(tomorrow.replace(hour=0, minute=0, second=0).timestamp())
         tomorrow_ts_end = int(tomorrow.replace(hour=23, minute=59, second=59).timestamp())
         
@@ -259,20 +279,290 @@ async def tomorrow_arrivals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             limit=50
         )
         
-        # Filter to arrivals tomorrow only
+        # Filter to confirmed arrivals tomorrow only (status=1)
+        CONFIRMED_STATUS = 1
         arrivals = [r for r in reservations 
-                   if tomorrow_ts_start <= r.get("arrivalDate", 0) <= tomorrow_ts_end]
+                   if r.get("status") == CONFIRMED_STATUS and tomorrow_ts_start <= r.get("arrivalDate", 0) <= tomorrow_ts_end]
         
         if not arrivals:
-            await update.message.reply_text(f"📭 Nema dolazaka sutra ({tomorrow_str}).")
+            await update.message.reply_text(f"📭 Nema dolazaka sutra ({tomorrow_display}).")
             return
         
-        text = f"📅 **Dolasci sutra ({tomorrow_str})**\n"
-        text += f"Ukupno: {len(arrivals)}\n"
-        text += "─" * 30
+        text = f"📅 **Dolasci sutra - {tomorrow_display}**\n"
+        text += f"Ukupno: {len(arrivals)}\n\n"
         
+        # Group by unit
+        from collections import defaultdict
+        by_unit = defaultdict(list)
         for res in arrivals:
-            text += "\n" + format_reservation(res, detailed=True) + "\n"
+            unit = res.get("unitName", "Unknown")
+            by_unit[unit].append(res)
+        
+        for unit in sorted(by_unit.keys()):
+            text += f"🏠 **{unit}**\n"
+            for res in by_unit[unit]:
+                guest = res.get("guestName", "Unknown")
+                phone = res.get("guestContactNumber", "")
+                nights = res.get("totalNights", 0)
+                adults = res.get("adults", 0)
+                price = res.get("totalPrice", 0)
+                text += f"  • {guest} ({nights} {'noć' if nights == 1 else 'noći'}, {adults} os., {price:.0f}€)\n"
+                if phone:
+                    text += f"    📞 {phone}\n"
+            text += "\n"
+        
+        await update.message.reply_text(text, parse_mode="Markdown")
+        
+    except RentlioAPIError as e:
+        await update.message.reply_text(f"❌ API Error: {e.message}")
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def checkouts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get today's and tomorrow's departures"""
+    await update.message.reply_text("🔍 Dohvaćam odlaske...")
+    
+    try:
+        today = datetime.now()
+        tomorrow = today + timedelta(days=1)
+        
+        today_str = today.strftime("%Y-%m-%d")
+        tomorrow_str = tomorrow.strftime("%Y-%m-%d")
+        today_display = today.strftime("%d.%m.%Y")
+        tomorrow_display = tomorrow.strftime("%d.%m.%Y")
+        
+        today_ts_start = int(today.replace(hour=0, minute=0, second=0).timestamp())
+        today_ts_end = int(today.replace(hour=23, minute=59, second=59).timestamp())
+        tomorrow_ts_start = int(tomorrow.replace(hour=0, minute=0, second=0).timestamp())
+        tomorrow_ts_end = int(tomorrow.replace(hour=23, minute=59, second=59).timestamp())
+        
+        reservations = await api.get_reservations(
+            date_from=today_str,
+            date_to=tomorrow_str,
+            limit=50
+        )
+        
+        # Filter confirmed only (status=1)
+        CONFIRMED_STATUS = 1
+        reservations = [r for r in reservations if r.get("status") == CONFIRMED_STATUS]
+        
+        today_departures = [r for r in reservations 
+                          if today_ts_start <= r.get("departureDate", 0) <= today_ts_end]
+        tomorrow_departures = [r for r in reservations 
+                              if tomorrow_ts_start <= r.get("departureDate", 0) <= tomorrow_ts_end]
+        
+        if not today_departures and not tomorrow_departures:
+            await update.message.reply_text("📭 Nema odlazaka danas ni sutra.")
+            return
+        
+        text = "🔴 **Odlasci**\n\n"
+        
+        if today_departures:
+            text += f"**Danas - {today_display}**\n"
+            for res in today_departures:
+                guest = res.get("guestName", "Unknown")
+                unit = res.get("unitName", "")
+                text += f"  • {guest} ← {unit}\n"
+            text += "\n"
+        
+        if tomorrow_departures:
+            text += f"**Sutra - {tomorrow_display}**\n"
+            for res in tomorrow_departures:
+                guest = res.get("guestName", "Unknown")
+                unit = res.get("unitName", "")
+                text += f"  • {guest} ← {unit}\n"
+        
+        await update.message.reply_text(text, parse_mode="Markdown")
+        
+    except RentlioAPIError as e:
+        await update.message.reply_text(f"❌ API Error: {e.message}")
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def current_guests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show who's currently staying in each apartment"""
+    await update.message.reply_text("🔍 Dohvaćam trenutne goste...")
+    
+    try:
+        today = datetime.now()
+        today_str = today.strftime("%Y-%m-%d")
+        today_ts = int(today.timestamp())
+        
+        # Get reservations that overlap with today
+        week_ago = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+        week_later = (today + timedelta(days=7)).strftime("%Y-%m-%d")
+        
+        reservations = await api.get_reservations(
+            date_from=week_ago,
+            date_to=week_later,
+            limit=50
+        )
+        
+        # Filter to confirmed reservations currently staying
+        CONFIRMED_STATUS = 1
+        current = []
+        for r in reservations:
+            if r.get("status") != CONFIRMED_STATUS:
+                continue
+            arrival = r.get("arrivalDate", 0)
+            departure = r.get("departureDate", 0)
+            # Guest is currently staying if: arrived <= today < departure
+            if arrival <= today_ts < departure:
+                current.append(r)
+        
+        if not current:
+            await update.message.reply_text("📭 Trenutno nema gostiju.")
+            return
+        
+        text = f"🏠 **Trenutni gosti** ({today.strftime('%d.%m.%Y %H:%M')})\n\n"
+        
+        # Group by unit
+        from collections import defaultdict
+        by_unit = defaultdict(list)
+        for res in current:
+            unit = res.get("unitName", "Unknown")
+            by_unit[unit].append(res)
+        
+        for unit in sorted(by_unit.keys()):
+            text += f"🏠 **{unit}**\n"
+            for res in by_unit[unit]:
+                guest = res.get("guestName", "Unknown")
+                departure = datetime.fromtimestamp(res.get("departureDate", 0))
+                days_left = (departure - today).days
+                checkout_str = departure.strftime("%d.%m")
+                phone = res.get("guestContactNumber", "")
+                
+                if days_left == 0:
+                    status = "🔴 odlazi danas"
+                elif days_left == 1:
+                    status = "🟡 odlazi sutra"
+                else:
+                    status = f"odlazi {checkout_str}"
+                
+                text += f"  • {guest} ({status})\n"
+                if phone:
+                    text += f"    📞 {phone}\n"
+            text += "\n"
+        
+        await update.message.reply_text(text, parse_mode="Markdown")
+        
+    except RentlioAPIError as e:
+        await update.message.reply_text(f"❌ API Error: {e.message}")
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def week_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show weekly statistics with occupancy and revenue"""
+    await update.message.reply_text("📊 Računam tjednu statistiku...")
+    
+    try:
+        today = datetime.now()
+        # Get current week (Monday to Sunday)
+        start_of_week = today - timedelta(days=today.weekday())
+        end_of_week = start_of_week + timedelta(days=6)
+        
+        start_str = start_of_week.strftime("%Y-%m-%d")
+        end_str = end_of_week.strftime("%Y-%m-%d")
+        start_display = start_of_week.strftime("%d.%m")
+        end_display = end_of_week.strftime("%d.%m")
+        
+        start_ts = int(start_of_week.replace(hour=0, minute=0, second=0).timestamp())
+        end_ts = int(end_of_week.replace(hour=23, minute=59, second=59).timestamp())
+        
+        reservations = await api.get_reservations(
+            date_from=start_str,
+            date_to=end_str,
+            limit=100
+        )
+        
+        # Filter confirmed only
+        CONFIRMED_STATUS = 1
+        reservations = [r for r in reservations if r.get("status") == CONFIRMED_STATUS]
+        
+        # Get unique units
+        units = set()
+        for r in reservations:
+            units.add(r.get("unitName", "Unknown"))
+        
+        # Calculate stats per unit
+        from collections import defaultdict
+        unit_stats = defaultdict(lambda: {"nights": 0, "revenue": 0, "guests": []})
+        
+        for res in reservations:
+            unit = res.get("unitName", "Unknown")
+            arrival = res.get("arrivalDate", 0)
+            departure = res.get("departureDate", 0)
+            price = res.get("totalPrice", 0)
+            total_nights = res.get("totalNights", 1)
+            guest = res.get("guestName", "Unknown")
+            
+            # Calculate nights within this week only
+            res_start = max(arrival, start_ts)
+            res_end = min(departure, end_ts)
+            
+            if res_end > res_start:
+                nights_in_week = (res_end - res_start) // 86400  # seconds in a day
+                nights_in_week = max(1, nights_in_week)  # at least 1 night
+                
+                # Proportional revenue for nights in this week
+                if total_nights > 0:
+                    revenue_per_night = price / total_nights
+                    week_revenue = revenue_per_night * nights_in_week
+                else:
+                    week_revenue = price
+                
+                unit_stats[unit]["nights"] += nights_in_week
+                unit_stats[unit]["revenue"] += week_revenue
+                unit_stats[unit]["guests"].append(guest)
+        
+        # Build message
+        text = f"📊 **Tjedna statistika**\n"
+        text += f"📅 {start_display} - {end_display}\n\n"
+        
+        total_revenue = 0
+        total_nights = 0
+        total_possible = 0
+        
+        for unit in sorted(unit_stats.keys()):
+            stats = unit_stats[unit]
+            nights = stats["nights"]
+            revenue = stats["revenue"]
+            occupancy = (nights / 7) * 100  # 7 days in a week
+            
+            total_revenue += revenue
+            total_nights += nights
+            total_possible += 7
+            
+            # Occupancy bar
+            filled = int(occupancy / 10)
+            bar = "█" * filled + "░" * (10 - filled)
+            
+            text += f"🏠 **{unit}**\n"
+            text += f"  {bar} {occupancy:.0f}%\n"
+            text += f"  📅 {nights}/7 noći\n"
+            text += f"  💰 {revenue:.0f}€\n"
+            if stats["guests"]:
+                text += f"  👥 {', '.join(stats['guests'][:3])}\n"
+            text += "\n"
+        
+        # Total summary
+        if total_possible > 0:
+            total_occupancy = (total_nights / total_possible) * 100
+        else:
+            total_occupancy = 0
+        
+        num_units = len(unit_stats)
+        text += "─" * 20 + "\n"
+        text += f"**UKUPNO** ({num_units} apartmana)\n"
+        text += f"💰 Prihod: **{total_revenue:.0f}€**\n"
+        text += f"📈 Popunjenost: **{total_occupancy:.0f}%**\n"
+        text += f"🛏️ {total_nights} noći\n"
         
         await update.message.reply_text(text, parse_mode="Markdown")
         
@@ -1172,12 +1462,14 @@ async def setup_bot_commands(app: Application):
     commands = [
         BotCommand("start", "Pokreni bota"),
         BotCommand("checkin", "🆕 API Check-in (bez forme!)"),
-        BotCommand("upcoming", "Rezervacije sljedećih 7 dana"),
+        BotCommand("current", "🏠 Trenutni gosti"),
         BotCommand("today", "Današnji dolasci"),
         BotCommand("tomorrow", "Sutrašnji dolasci"),
+        BotCommand("checkouts", "Odlasci danas/sutra"),
+        BotCommand("upcoming", "Dolasci sljedećih 7 dana"),
+        BotCommand("week", "📊 Tjedna statistika"),
         BotCommand("search", "Pretraži po imenu gosta"),
         BotCommand("invoice", "Upravljanje računima"),
-        BotCommand("notifications", "Uključi/isključi notifikacije"),
         BotCommand("help", "Pomoć"),
     ]
     await app.bot.set_my_commands(commands)
@@ -1480,6 +1772,9 @@ def main():
     app.add_handler(CommandHandler("upcoming", upcoming_reservations))
     app.add_handler(CommandHandler("today", today_arrivals))
     app.add_handler(CommandHandler("tomorrow", tomorrow_arrivals))
+    app.add_handler(CommandHandler("checkouts", checkouts_command))
+    app.add_handler(CommandHandler("current", current_guests))
+    app.add_handler(CommandHandler("week", week_stats))
     app.add_handler(CommandHandler("search", search_guest))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("notifications", toggle_notifications))
