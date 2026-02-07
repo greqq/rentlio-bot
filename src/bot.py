@@ -389,9 +389,7 @@ async def current_guests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         today = datetime.now()
-        today_str = today.strftime("%Y-%m-%d")
-        today_ts = int(today.timestamp())
-        
+
         # Get reservations that overlap with today
         week_ago = (today - timedelta(days=7)).strftime("%Y-%m-%d")
         week_later = (today + timedelta(days=7)).strftime("%Y-%m-%d")
@@ -404,14 +402,19 @@ async def current_guests(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Filter to confirmed reservations currently staying
         CONFIRMED_STATUS = 1
+        today_date = today.date()
         current = []
         for r in reservations:
             if r.get("status") != CONFIRMED_STATUS:
                 continue
             arrival = r.get("arrivalDate", 0)
             departure = r.get("departureDate", 0)
-            # Guest is currently staying if: arrived <= today < departure
-            if arrival <= today_ts < departure:
+            # Compare using dates only (API timestamps are at midnight, so
+            # timestamp comparison breaks on the checkout day itself)
+            arrival_date = datetime.fromtimestamp(arrival).date()
+            departure_date = datetime.fromtimestamp(departure).date()
+            # Guest is currently staying if: arrived <= today <= departure day
+            if arrival_date <= today_date <= departure_date:
                 current.append(r)
         
         if not current:
@@ -432,7 +435,7 @@ async def current_guests(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for res in by_unit[unit]:
                 guest = res.get("guestName", "Unknown")
                 departure = datetime.fromtimestamp(res.get("departureDate", 0))
-                days_left = (departure - today).days
+                days_left = (departure.date() - today_date).days
                 checkout_str = departure.strftime("%d.%m")
                 phone = res.get("guestContactNumber", "")
                 
