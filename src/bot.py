@@ -1104,15 +1104,20 @@ async def perform_api_checkin(query, context, reservation_id: str):
                     logger.error(f"PUT update failed: {e}")
                     messages.append("⚠️ Dokument polja: potreban ručni unos")
         
-        # Verify: fetch guest data back to confirm document fields saved
+        # Verify: fetch guest data back to confirm document fields were saved
+        # Use the old endpoint which returns documentNumber, travelDocumentTypesId etc.
         try:
-            verify = await api.get_reservation_guests(reservation_id)
-            holder = verify.get('holder', {})
+            verify_response = await api._request(
+                "GET", f"/reservations/{reservation_id}/guests"
+            )
+            holder = verify_response.get('holder', {})
             logger.info(
                 f"Verify holder: name={holder.get('name')}, "
                 f"documentNumber={holder.get('documentNumber')}, "
                 f"travelDocumentTypesId={holder.get('travelDocumentTypesId')}, "
-                f"arrivalArrangementsId={holder.get('arrivalArrangementsId')}"
+                f"arrivalArrangementsId={holder.get('arrivalArrangementsId')}, "
+                f"providedServicesTypesId={holder.get('providedServicesTypesId')}, "
+                f"cityOfResidence={holder.get('cityOfResidence')}"
             )
         except Exception as e:
             logger.warning(f"Verify GET failed: {e}")
