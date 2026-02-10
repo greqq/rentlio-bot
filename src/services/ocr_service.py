@@ -46,9 +46,11 @@ class ExtractedGuestData:
     full_name: Optional[str] = None
     date_of_birth: Optional[str] = None  # Format: DD.MM.YYYY
     document_number: Optional[str] = None
+    document_type: Optional[str] = None  # "ID_CARD", "PASSPORT"
     nationality: Optional[str] = None
     gender: Optional[str] = None  # M or F
     place_of_residence: Optional[str] = None
+    address: Optional[str] = None  # Street address
     expiry_date: Optional[str] = None
     oib: Optional[str] = None  # Croatian OIB
     raw_text: str = ""
@@ -73,9 +75,11 @@ class ExtractedGuestData:
             "fullName": full_name or "",
             "dateOfBirth": self.date_of_birth or "",
             "documentNumber": self.document_number or "",
+            "documentType": self.document_type or "",
             "nationality": self.nationality or "",
             "gender": self.gender or "",
             "placeOfResidence": self.place_of_residence or "",
+            "address": self.address or "",
             "expiryDate": self.expiry_date or "",
             "oib": self.oib or "",
         }
@@ -95,7 +99,12 @@ class ExtractedGuestData:
             lines.append(f"🎂 Datum rođenja: {self.date_of_birth}")
         
         if self.document_number:
-            lines.append(f"🪪 Broj dokumenta: {self.document_number}")
+            doc_type_label = ""
+            if self.document_type == "ID_CARD":
+                doc_type_label = " (Osobna)"
+            elif self.document_type == "PASSPORT":
+                doc_type_label = " (Putovnica)"
+            lines.append(f"🪪 Broj dokumenta: {self.document_number}{doc_type_label}")
         
         if self.gender:
             gender_text = "Žensko" if self.gender == 'F' else "Muško"
@@ -173,9 +182,11 @@ class OCRService:
             logger.info("Extracted data from MRZ")
             mrz_data.extraction_method = "MRZ"
             # Also try to get residence from visual text (not in MRZ)
-            residence = self._extract_residence(text)
-            if residence:
-                mrz_data.place_of_residence = residence
+            city, address = self._extract_residence(text)
+            if city:
+                mrz_data.place_of_residence = city
+            if address:
+                mrz_data.address = address
             return mrz_data
         
         # Try Croatian ID specific parsing
@@ -240,11 +251,26 @@ class OCRService:
         
         # Parse document info lines
         for line in mrz_lines:
-            # Croatian ID line 1: IOHRV + 9 digit doc number
+            # Croatian ID line 1: IOHRV + 9 digit doc number + check + OIB(11)
             match = re.search(r'I[OACD]?HRV(\d{9})', line)
             if match:
                 data.document_number = match.group(1)
+                data.document_type = "ID_CARD"
                 data.nationality = 'Hrvatska'
+                # Extract OIB (11 digits after doc number + check digit)
+                oib_match = re.search(r'I[OACD]?HRV\d{10}(\d{11})', line)
+                if oib_match:
+                    data.oib = oib_match.group(1)
+                continue
+            
+            # Passport line 1: P<HRV or PHRV
+            if re.search(r'P[<A-Z]?HRV', line):
+                data.document_type = "PASSPORT"
+                data.nationality = 'Hrvatska'
+                # Extract passport number (after country code)
+                pass_match = re.search(r'P[<A-Z]?HRV([A-Z0-9]{7,9})', line)
+                if pass_match:
+                    data.document_number = pass_match.group(1)
                 continue
             
             # Line 2: YYMMDD (DOB) + check + sex + YYMMDD (expiry)
@@ -376,31 +402,67 @@ class OCRService:
             data.nationality = 'Hrvatska'
         
         # Extract residence
-        data.place_of_residence = self._extract_residence(text)
+        city, address = self._extract_residence(text)
+        if city:
+            data.place_of_residence = city
+        if address:
+            data.address = address
         
         return data
     
-    def _extract_residence(self, text: str) -> Optional[str]:
-        """Extract place of residence (city only) from text"""
+    def _extract_residence(self, text: str) -> tuple[Optional[str], Optional[str]]:
+        """
+        Extract place of residence (city) and address from text
+        
+        Returns:
+            (city, address) tuple
+        """
         lines = [l.strip() for l in text.split('\n') if l.strip()]
+        city = None
+        address = None
         
         for i, line in enumerate(lines):
             line_upper = line.upper()
-            if 'PREBIVALIŠTE' in line_upper or 'RESIDENCE' in line_upper:
-                # Residence is usually on the next line
+            if 'PREBIVALIŠTE' not in line_upper and 'RESIDENCE' not in line_upper:
+                continue
+            
+            # Check if city is on the same line (after the label)
+            # e.g. "PREBIVALIŠTE/RESIDENCE LADIMIREVCI, VALPOVO"
+            after_label = line_upper
+            for label in ['PREBIVALIŠTE/RESIDENCE', 'PREBIVALIŠTE', 'RESIDENCE']:
+                if label in after_label:
+                    after_label = after_label.split(label, 1)[-1].strip()
+                    break
+            
+            if after_label and len(after_label) > 2 and not after_label.startswith('/'):
+                # City is on the same line
+                parts = after_label.split(',')
+                city = parts[0].strip().title()
+                # Next line might be the address
                 if i + 1 < len(lines):
-                    next_line = lines[i + 1].strip()
-                    # Stop if we hit another label
-                    if any(label in next_line.upper() for label in ['IZDALA', 'ISSUED', 'DATUM', 'OIB', 'MBG']):
-                        continue
-                    if next_line:
-                        # Extract just the city name (first part before comma or second word if duplicated)
-                        # Format is usually "CITY, CITY" or "CITY, STREET ADDRESS"
-                        parts = next_line.split(',')
-                        city = parts[0].strip()
-                        # If it's "VUKOVAR, VUKOVAR" just take one
-                        return city
-        return None
+                    addr_line = lines[i + 1].strip()
+                    if not any(lbl in addr_line.upper() for lbl in ['IZDALA', 'ISSUED', 'DATUM', 'OIB', 'MBG', 'PREBIVALIŠTE']):
+                        address = addr_line.title()
+            elif i + 1 < len(lines):
+                # City is on the next line
+                next_line = lines[i + 1].strip()
+                if any(lbl in next_line.upper() for lbl in ['IZDALA', 'ISSUED', 'DATUM', 'OIB', 'MBG']):
+                    continue
+                if next_line:
+                    # Format: "LADIMIREVCI, VALPOVO" - take the full city string
+                    city = next_line.title()
+                    # Check for address on the line after
+                    if i + 2 < len(lines):
+                        addr_line = lines[i + 2].strip()
+                        if not any(lbl in addr_line.upper() for lbl in ['IZDALA', 'ISSUED', 'DATUM', 'OIB', 'MBG']):
+                            # If it looks like a street address (has number), save it
+                            if re.search(r'\d', addr_line):
+                                address = addr_line.title()
+            
+            if city:
+                break
+        
+        return city, address
     
     def _parse_generic(self, text: str) -> ExtractedGuestData:
         """Generic parsing fallback"""

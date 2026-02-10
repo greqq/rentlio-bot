@@ -12,6 +12,7 @@ Features:
 - Daily notifications for check-ins and check-outs
 """
 import asyncio
+import calendar
 import logging
 import sys
 from pathlib import Path
@@ -896,23 +897,18 @@ async def show_reservation_selection(query, context):
 
 
 def convert_date_to_timestamp(date_str: str) -> Optional[str]:
-    """Convert DD.MM.YYYY to Unix timestamp string"""
+    """Convert DD.MM.YYYY to Unix timestamp string (UTC midnight)"""
     if not date_str:
         return None
     
-    try:
-        # Try DD.MM.YYYY format
-        dt = datetime.strptime(date_str, "%d.%m.%Y")
-        return str(int(dt.timestamp()))
-    except ValueError:
-        pass
-    
-    try:
-        # Try YYYY-MM-DD format
-        dt = datetime.strptime(date_str, "%Y-%m-%d")
-        return str(int(dt.timestamp()))
-    except ValueError:
-        pass
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(date_str, fmt)
+            # Use calendar.timegm to treat as UTC midnight
+            # (datetime.timestamp() uses local tz, causing off-by-one day)
+            return str(int(calendar.timegm(dt.timetuple())))
+        except ValueError:
+            continue
     
     return None
 
@@ -927,6 +923,48 @@ def convert_gender_to_id(gender: str) -> Optional[int]:
         return 2
     elif g in ('F', 'FEMALE', 'ŽENSKO', 'ZENSKO', 'ŽENSKI'):
         return 1
+    return None
+
+
+# Cache for document type enums
+_document_types_cache: dict = {}
+
+
+async def _get_document_type_id(doc_type: str) -> Optional[int]:
+    """Get Rentlio document type ID for a document type string.
+    
+    Args:
+        doc_type: "ID_CARD" or "PASSPORT"
+    
+    Returns:
+        Rentlio travelDocumentTypesId or None
+    """
+    global _document_types_cache
+    
+    if not _document_types_cache:
+        try:
+            types = await api.get_document_types()
+            # Build lookup: name -> id
+            for t in types:
+                if isinstance(t, dict):
+                    _document_types_cache[t.get('id')] = t.get('name', '')
+            logger.info(f"Document types loaded: {_document_types_cache}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch document types: {e}")
+            return None
+    
+    # Map our internal type to Rentlio type name
+    type_keywords = {
+        "ID_CARD": ["osobna", "identity", "id card", "iskaznica"],
+        "PASSPORT": ["putovnica", "passport"],
+    }
+    
+    keywords = type_keywords.get(doc_type, [])
+    for type_id, type_name in _document_types_cache.items():
+        name_lower = type_name.lower()
+        if any(kw in name_lower for kw in keywords):
+            return int(type_id)
+    
     return None
 
 
@@ -970,7 +1008,7 @@ async def perform_api_checkin(query, context, reservation_id: str):
                 "isAdditional": "N" if i == 0 else "Y",  # Others are additional
             }
             
-            # Date of birth
+            # Date of birth (UTC midnight to avoid timezone off-by-one)
             if guest.date_of_birth:
                 ts = convert_date_to_timestamp(guest.date_of_birth)
                 if ts:
@@ -992,13 +1030,23 @@ async def perform_api_checkin(query, context, reservation_id: str):
                 api_guest["countryOfBirthId"] = country_id
                 api_guest["countryOfResidenceId"] = country_id
             
-            # Document number - send as direct field (API may accept it)
+            # Document type + number (must send together)
             if guest.document_number:
                 api_guest["documentNumber"] = guest.document_number
+                # Fetch document type ID from enum
+                if hasattr(guest, 'document_type') and guest.document_type:
+                    doc_type_id = await _get_document_type_id(guest.document_type)
+                    if doc_type_id:
+                        api_guest["travelDocumentTypesId"] = doc_type_id
+                        logger.info(f"Guest {name}: documentType={guest.document_type} -> id={doc_type_id}")
             
             # City of residence
             if guest.place_of_residence:
                 api_guest["cityOfResidence"] = guest.place_of_residence
+            
+            # Street address
+            if hasattr(guest, 'address') and guest.address:
+                api_guest["address"] = guest.address
             
             # Build note with document info as backup
             note_parts = []
