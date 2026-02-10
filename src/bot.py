@@ -926,46 +926,35 @@ def convert_gender_to_id(gender: str) -> Optional[int]:
     return None
 
 
-# Cache for document type enums
-_document_types_cache: dict = {}
+# Direct mapping: (document_type, is_croatian) -> Rentlio travelDocumentTypesId
+# IDs from /enums/guests/document-types
+_DOCUMENT_TYPE_IDS = {
+    ("ID_CARD", True): 25,       # Personal ID card (Croatian)
+    ("ID_CARD", False): 23,      # Personal ID card (foreign)
+    ("PASSPORT", True): 14,      # Personal passport (Croatian)
+    ("PASSPORT", False): 18,     # Personal passport (foreign)
+}
 
 
-async def _get_document_type_id(doc_type: str) -> Optional[int]:
-    """Get Rentlio document type ID for a document type string.
+def _get_document_type_id(doc_type: str, nationality: str = None) -> Optional[int]:
+    """Get Rentlio document type ID.
     
     Args:
         doc_type: "ID_CARD" or "PASSPORT"
+        nationality: Guest nationality string
     
     Returns:
         Rentlio travelDocumentTypesId or None
     """
-    global _document_types_cache
-    
-    if not _document_types_cache:
-        try:
-            types = await api.get_document_types()
-            # Build lookup: name -> id
-            for t in types:
-                if isinstance(t, dict):
-                    _document_types_cache[t.get('id')] = t.get('name', '')
-            logger.info(f"Document types loaded: {_document_types_cache}")
-        except Exception as e:
-            logger.warning(f"Failed to fetch document types: {e}")
-            return None
-    
-    # Map our internal type to Rentlio type name
-    type_keywords = {
-        "ID_CARD": ["osobna", "identity", "id card", "iskaznica"],
-        "PASSPORT": ["putovnica", "passport"],
-    }
-    
-    keywords = type_keywords.get(doc_type, [])
-    for type_id, type_name in _document_types_cache.items():
-        name_lower = type_name.lower()
-        if any(kw in name_lower for kw in keywords):
-            return int(type_id)
-    
-    return None
+    if not doc_type:
+        return None
+    is_croatian = nationality and nationality.lower() in ('hrvatska', 'croatia', 'hrv', 'cro')
+    type_id = _DOCUMENT_TYPE_IDS.get((doc_type, is_croatian))
+    if type_id is None:
+        # Fallback: try without nationality
+        type_id = _DOCUMENT_TYPE_IDS.get((doc_type, False))
+    logger.info(f"Document type mapping: {doc_type}, croatian={is_croatian} -> id={type_id}")
+    return type_id
 
 
 async def perform_api_checkin(query, context, reservation_id: str):
@@ -984,8 +973,12 @@ async def perform_api_checkin(query, context, reservation_id: str):
     )
     
     try:
-        # Convert OCR data to API format
+        # Phase 1: Build guest data and add via POST
+        # NOTE: POST /reservations-guests only supports basic fields.
+        # documentNumber, travelDocumentTypesId etc. require a separate PUT update.
         api_guests = []
+        guest_extra_data = []  # Store doc fields for PUT update
+        
         for i, guest in enumerate(guests):
             # Build full name
             name = guest.full_name
@@ -1000,12 +993,12 @@ async def perform_api_checkin(query, context, reservation_id: str):
             if guest.nationality:
                 country_id = country_mapper.get_country_id(guest.nationality)
             
-            # Build guest object with ALL available fields
+            # Build guest object with fields supported by POST
             api_guest = {
                 "name": name,
                 "isBooker": "N",
-                "isPrimary": "Y" if i == 0 else "N",  # First guest is primary
-                "isAdditional": "N" if i == 0 else "Y",  # Others are additional
+                "isPrimary": "Y" if i == 0 else "N",
+                "isAdditional": "N" if i == 0 else "Y",
             }
             
             # Date of birth (UTC midnight to avoid timezone off-by-one)
@@ -1014,8 +1007,6 @@ async def perform_api_checkin(query, context, reservation_id: str):
                 if ts:
                     api_guest["dateOfBirth"] = ts
                     logger.info(f"Guest {name}: dateOfBirth={guest.date_of_birth} -> ts={ts}")
-                else:
-                    logger.warning(f"Guest {name}: failed to convert dateOfBirth '{guest.date_of_birth}'")
             
             # Gender
             if guest.gender:
@@ -1023,22 +1014,12 @@ async def perform_api_checkin(query, context, reservation_id: str):
                 if gender_id:
                     api_guest["genderId"] = gender_id
             
-            # Country fields - set ALL country-related fields from nationality
+            # Country fields
             if country_id:
                 api_guest["countryId"] = country_id
                 api_guest["citizenshipCountryId"] = country_id
                 api_guest["countryOfBirthId"] = country_id
                 api_guest["countryOfResidenceId"] = country_id
-            
-            # Document type + number (must send together)
-            if guest.document_number:
-                api_guest["documentNumber"] = guest.document_number
-                # Fetch document type ID from enum
-                if hasattr(guest, 'document_type') and guest.document_type:
-                    doc_type_id = await _get_document_type_id(guest.document_type)
-                    if doc_type_id:
-                        api_guest["travelDocumentTypesId"] = doc_type_id
-                        logger.info(f"Guest {name}: documentType={guest.document_type} -> id={doc_type_id}")
             
             # City of residence
             if guest.place_of_residence:
@@ -1048,7 +1029,7 @@ async def perform_api_checkin(query, context, reservation_id: str):
             if hasattr(guest, 'address') and guest.address:
                 api_guest["address"] = guest.address
             
-            # Build note with document info as backup
+            # Build note with document info
             note_parts = []
             if guest.document_number:
                 note_parts.append(f"Doc: {guest.document_number}")
@@ -1059,15 +1040,54 @@ async def perform_api_checkin(query, context, reservation_id: str):
             if note_parts:
                 api_guest["note"] = " | ".join(note_parts)
             
-            logger.info(f"Guest {i+1} API data: {api_guest}")
+            # Collect extra data for PUT update (not supported by POST)
+            extra = {}
+            if guest.document_number:
+                extra["documentNumber"] = guest.document_number
+            doc_type = getattr(guest, 'document_type', None)
+            if doc_type:
+                doc_type_id = _get_document_type_id(doc_type, guest.nationality)
+                if doc_type_id:
+                    extra["travelDocumentTypesId"] = doc_type_id
+            # Default eVisitor fields for Croatian guests
+            if country_id == 53:  # Croatia
+                extra.setdefault("arrivalArrangementsId", 1)   # Personal
+                extra.setdefault("providedServicesTypesId", 1)  # Default service
+            guest_extra_data.append(extra)
+            
+            logger.info(f"Guest {i+1} POST data: {api_guest}")
+            logger.info(f"Guest {i+1} extra (for PUT): {extra}")
             api_guests.append(api_guest)
         
-        # Call API to add guests
+        # Phase 1: POST - Add guests (basic fields)
         result = await api.add_reservation_guests(reservation_id, api_guests)
-        
-        # Check result
         added = result.get('guestAdded', [])
         messages = result.get('messages', [])
+        logger.info(f"Add guests result: added={added}, messages={messages}")
+        
+        # Phase 2: PUT - Update added guests with document fields
+        if added:
+            update_guests = []
+            for i, guest_id in enumerate(added):
+                if i < len(guest_extra_data) and guest_extra_data[i]:
+                    update_obj = {
+                        "id": guest_id,
+                        "name": api_guests[i]["name"],  # name is required
+                        **guest_extra_data[i],
+                    }
+                    update_guests.append(update_obj)
+            
+            if update_guests:
+                try:
+                    update_result = await api.update_reservation_guests(reservation_id, update_guests)
+                    updated = update_result.get('guestUpdated', [])
+                    update_msgs = update_result.get('messages', [])
+                    logger.info(f"Update guests result: updated={updated}, messages={update_msgs}")
+                    if update_msgs:
+                        messages.extend(update_msgs)
+                except Exception as e:
+                    logger.warning(f"Guest update (document fields) failed: {e}")
+                    messages.append(f"Dokument polja: potreban ručni unos")
         
         logger.info(f"Add guests result: added={added}, messages={messages}")
         

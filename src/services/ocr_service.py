@@ -183,6 +183,7 @@ class OCRService:
             mrz_data.extraction_method = "MRZ"
             # Also try to get residence from visual text (not in MRZ)
             city, address = self._extract_residence(text)
+            logger.info(f"Residence extraction: city={city}, address={address}")
             if city:
                 mrz_data.place_of_residence = city
             if address:
