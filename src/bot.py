@@ -973,10 +973,12 @@ async def perform_api_checkin(query, context, reservation_id: str):
     )
     
     try:
-        # Build guest data and add via single POST
-        # The API accepts documentNumber/travelDocumentTypesId even though
-        # the official schema doesn't list them — do NOT split into POST+PUT.
+        # Phase 1: POST — create guests with basic fields only
+        # The /reservations-guests/ POST schema only supports basic fields.
+        # Document fields (documentNumber, travelDocumentTypesId, etc.) must
+        # be set via a separate PUT call after the guest is created.
         api_guests = []
+        guest_doc_data = []  # Store doc-related fields for Phase 2 PUT
         
         for i, guest in enumerate(guests):
             # Build full name
@@ -992,12 +994,16 @@ async def perform_api_checkin(query, context, reservation_id: str):
             if guest.nationality:
                 country_id = country_mapper.get_country_id(guest.nationality)
             
-            # Build guest object with ALL available fields
+            # Role flags
+            is_primary = "Y" if i == 0 else "N"
+            is_additional = "N" if i == 0 else "Y"
+            
+            # Build guest object with fields supported by POST
             api_guest = {
                 "name": name,
                 "isBooker": "N",
-                "isPrimary": "Y" if i == 0 else "N",
-                "isAdditional": "N" if i == 0 else "Y",
+                "isPrimary": is_primary,
+                "isAdditional": is_additional,
             }
             
             # Date of birth (UTC midnight to avoid timezone off-by-one)
@@ -1020,19 +1026,6 @@ async def perform_api_checkin(query, context, reservation_id: str):
                 api_guest["countryOfBirthId"] = country_id
                 api_guest["countryOfResidenceId"] = country_id
             
-            # Document number + type
-            if guest.document_number:
-                api_guest["documentNumber"] = str(guest.document_number)
-            doc_type = getattr(guest, 'document_type', None)
-            if doc_type:
-                doc_type_id = _get_document_type_id(doc_type, guest.nationality)
-                if doc_type_id:
-                    api_guest["travelDocumentTypesId"] = str(doc_type_id)
-            
-            # eVisitor fields
-            api_guest["arrivalArrangementsId"] = "1"   # Personal
-            api_guest["providedServicesTypesId"] = "1"  # Default
-            
             # City of residence
             if guest.place_of_residence:
                 api_guest["cityOfResidence"] = guest.place_of_residence
@@ -1052,14 +1045,77 @@ async def perform_api_checkin(query, context, reservation_id: str):
             if note_parts:
                 api_guest["note"] = " | ".join(note_parts)
             
-            logger.info(f"Guest {i+1} API data: {api_guest}")
+            # Collect document data for PUT update
+            doc_fields = {}
+            if guest.document_number:
+                doc_fields["documentNumber"] = str(guest.document_number)
+            doc_type = getattr(guest, 'document_type', None)
+            if doc_type:
+                doc_type_id = _get_document_type_id(doc_type, guest.nationality)
+                if doc_type_id:
+                    doc_fields["travelDocumentTypesId"] = str(doc_type_id)
+            doc_fields["arrivalArrangementsId"] = "1"   # Personal
+            doc_fields["providedServicesTypesId"] = "1"  # Accommodation
+            guest_doc_data.append(doc_fields)
+            
+            logger.info(f"Guest {i+1} POST data: {api_guest}")
+            logger.info(f"Guest {i+1} doc fields (for PUT): {doc_fields}")
             api_guests.append(api_guest)
         
-        # Add guests (single POST with all fields)
+        # Phase 1: POST - create guests
         result = await api.add_reservation_guests(reservation_id, api_guests)
         added = result.get('guestAdded', [])
         messages = result.get('messages', [])
-        logger.info(f"Add guests result: added={added}, messages={messages}")
+        logger.info(f"POST result: added={added}, messages={messages}")
+        
+        # Phase 2: PUT - update created guests with document fields
+        # Previous PUT failed with 400 because isBooker/isPrimary/isAdditional
+        # were missing. Include ALL required fields this time.
+        if added:
+            update_guests = []
+            for i, guest_id in enumerate(added):
+                if i >= len(api_guests) or i >= len(guest_doc_data):
+                    break
+                if not guest_doc_data[i].get("documentNumber"):
+                    continue  # No doc data to update
+                
+                update_obj = {
+                    "id": guest_id,
+                    "name": api_guests[i]["name"],
+                    "isBooker": api_guests[i]["isBooker"],
+                    "isPrimary": api_guests[i]["isPrimary"],
+                    "isAdditional": api_guests[i]["isAdditional"],
+                    **guest_doc_data[i],
+                }
+                update_guests.append(update_obj)
+                logger.info(f"Guest {i+1} PUT data: {update_obj}")
+            
+            if update_guests:
+                try:
+                    update_result = await api.update_reservation_guests(
+                        reservation_id, update_guests
+                    )
+                    updated_ids = update_result.get('guestUpdated', [])
+                    update_msgs = update_result.get('messages', [])
+                    logger.info(f"PUT result: updated={updated_ids}, messages={update_msgs}")
+                    if update_msgs:
+                        messages.extend(update_msgs)
+                except Exception as e:
+                    logger.error(f"PUT update failed: {e}")
+                    messages.append("⚠️ Dokument polja: potreban ručni unos")
+        
+        # Verify: fetch guest data back to confirm document fields saved
+        try:
+            verify = await api.get_reservation_guests(reservation_id)
+            holder = verify.get('holder', {})
+            logger.info(
+                f"Verify holder: name={holder.get('name')}, "
+                f"documentNumber={holder.get('documentNumber')}, "
+                f"travelDocumentTypesId={holder.get('travelDocumentTypesId')}, "
+                f"arrivalArrangementsId={holder.get('arrivalArrangementsId')}"
+            )
+        except Exception as e:
+            logger.warning(f"Verify GET failed: {e}")
         
         # If guests were added/exist, mark reservation as checked-in
         checkin_status = ""
