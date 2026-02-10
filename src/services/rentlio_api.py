@@ -137,10 +137,10 @@ class RentlioAPI:
             guest_name: Search by guest name
             limit: Maximum results
         """
-        params = {"limit": limit}
+        params = {"perPage": limit}
         
         if property_id:
-            params["propertyId"] = property_id
+            params["propertiesId"] = property_id
         if date_from:
             params["dateFrom"] = date_from
         if date_to:
@@ -164,11 +164,19 @@ class RentlioAPI:
     
     async def checkin_reservation(self, reservation_id: str) -> dict:
         """Mark reservation as checked-in"""
-        return await self._request("PUT", f"/reservations/{reservation_id}/checkin")
+        return await self._request(
+            "PUT", 
+            f"/reservations/{reservation_id}/checkin",
+            json_data={"checkIn": True}
+        )
     
     async def checkout_reservation(self, reservation_id: str) -> dict:
         """Mark reservation as checked-out"""
-        return await self._request("PUT", f"/reservations/{reservation_id}/checkout")
+        return await self._request(
+            "PUT",
+            f"/reservations/{reservation_id}/checkout",
+            json_data={"checkOut": True}
+        )
     
     # ========== Invoices ==========
     

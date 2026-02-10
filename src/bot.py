@@ -383,6 +383,77 @@ async def checkouts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 
+async def cleaning_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show departures for next 7 days - for cleaning schedule"""
+    await update.message.reply_text("🧹 Dohvaćam raspored čišćenja...")
+    
+    try:
+        today = datetime.now()
+        week_later = today + timedelta(days=7)
+        
+        today_str = today.strftime("%Y-%m-%d")
+        week_str = week_later.strftime("%Y-%m-%d")
+        
+        today_ts = int(today.replace(hour=0, minute=0, second=0).timestamp())
+        week_ts = int(week_later.replace(hour=23, minute=59, second=59).timestamp())
+        
+        reservations = await api.get_reservations(
+            date_from=today_str,
+            date_to=week_str,
+            limit=100
+        )
+        
+        # Filter confirmed departures in next 7 days (status=1)
+        CONFIRMED_STATUS = 1
+        departures = [r for r in reservations 
+                     if r.get("status") == CONFIRMED_STATUS and today_ts <= r.get("departureDate", 0) <= week_ts]
+        
+        if not departures:
+            await update.message.reply_text("📭 Nema odlazaka u sljedećih 7 dana.")
+            return
+        
+        # Sort by departure date
+        departures.sort(key=lambda x: x.get("departureDate", 0))
+        
+        text = f"🧹 **Raspored čišćenja - sljedećih 7 dana**\n\n"
+        
+        # Group by date
+        from collections import defaultdict
+        by_date = defaultdict(list)
+        for res in departures:
+            departure_date = datetime.fromtimestamp(res.get("departureDate", 0)).strftime("%d.%m (%a)")
+            by_date[departure_date].append(res)
+        
+        # Get sorted dates
+        sorted_dates = sorted(by_date.keys(), key=lambda d: datetime.strptime(d.split(" ")[0], "%d.%m"))
+        
+        for date_str in sorted_dates:
+            text += f"📅 **{date_str}**\n"
+            
+            # Group by unit
+            unit_groups = defaultdict(list)
+            for res in by_date[date_str]:
+                unit = res.get("unitName", "Unknown")
+                unit_groups[unit].append(res)
+            
+            for unit in sorted(unit_groups.keys()):
+                text += f"  🏠 {unit}\n"
+                for res in unit_groups[unit]:
+                    guest = res.get("guestName", "Unknown")
+                    text += f"    • {guest}\n"
+            text += "\n"
+        
+        text += f"📊 Ukupno: {len(departures)} odlazaka\n"
+        
+        await update.message.reply_text(text, parse_mode="Markdown")
+        
+    except RentlioAPIError as e:
+        await update.message.reply_text(f"❌ API Error: {e.message}")
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
 async def current_guests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show who's currently staying in each apartment"""
     await update.message.reply_text("🔍 Dohvaćam trenutne goste...")
@@ -764,6 +835,10 @@ async def show_reservation_selection(query, context):
             limit=20
         )
         
+        # Filter to confirmed only (status=1)
+        CONFIRMED_STATUS = 1
+        reservations = [r for r in reservations if r.get('status') == CONFIRMED_STATUS]
+        
         if not reservations:
             await query.edit_message_text(
                 "📭 Nema rezervacija u sljedećih 5 dana.\n\n"
@@ -887,7 +962,7 @@ async def perform_api_checkin(query, context, reservation_id: str):
             if guest.nationality:
                 country_id = country_mapper.get_country_id(guest.nationality)
             
-            # Build guest object
+            # Build guest object with ALL available fields
             api_guest = {
                 "name": name,
                 "isBooker": "N",
@@ -895,28 +970,48 @@ async def perform_api_checkin(query, context, reservation_id: str):
                 "isAdditional": "N" if i == 0 else "Y",  # Others are additional
             }
             
-            # Add optional fields if available
+            # Date of birth
             if guest.date_of_birth:
                 ts = convert_date_to_timestamp(guest.date_of_birth)
                 if ts:
                     api_guest["dateOfBirth"] = ts
+                    logger.info(f"Guest {name}: dateOfBirth={guest.date_of_birth} -> ts={ts}")
+                else:
+                    logger.warning(f"Guest {name}: failed to convert dateOfBirth '{guest.date_of_birth}'")
             
+            # Gender
             if guest.gender:
                 gender_id = convert_gender_to_id(guest.gender)
                 if gender_id:
                     api_guest["genderId"] = gender_id
             
+            # Country fields - set ALL country-related fields from nationality
             if country_id:
                 api_guest["countryId"] = country_id
                 api_guest["citizenshipCountryId"] = country_id
+                api_guest["countryOfBirthId"] = country_id
+                api_guest["countryOfResidenceId"] = country_id
             
+            # Document number - send as direct field (API may accept it)
             if guest.document_number:
-                # Store in note field since there's no direct field
-                api_guest["note"] = f"Doc: {guest.document_number}"
+                api_guest["documentNumber"] = guest.document_number
             
+            # City of residence
             if guest.place_of_residence:
                 api_guest["cityOfResidence"] = guest.place_of_residence
             
+            # Build note with document info as backup
+            note_parts = []
+            if guest.document_number:
+                note_parts.append(f"Doc: {guest.document_number}")
+            if guest.expiry_date:
+                note_parts.append(f"Exp: {guest.expiry_date}")
+            if guest.oib:
+                note_parts.append(f"OIB: {guest.oib}")
+            if note_parts:
+                api_guest["note"] = " | ".join(note_parts)
+            
+            logger.info(f"Guest {i+1} API data: {api_guest}")
             api_guests.append(api_guest)
         
         # Call API to add guests
@@ -925,6 +1020,19 @@ async def perform_api_checkin(query, context, reservation_id: str):
         # Check result
         added = result.get('guestAdded', [])
         messages = result.get('messages', [])
+        
+        logger.info(f"Add guests result: added={added}, messages={messages}")
+        
+        # If guests were added/exist, mark reservation as checked-in
+        checkin_status = ""
+        if added or messages:  # Even if guests existed already, try checkin
+            try:
+                checkin_result = await api.checkin_reservation(reservation_id)
+                logger.info(f"Checkin result: {checkin_result}")
+                checkin_status = "\n✅ Rezervacija označena kao checked-in"
+            except RentlioAPIError as e:
+                logger.warning(f"Checkin status update failed: {e.message}")
+                checkin_status = f"\n⚠️ Gosti dodani, ali checkin status: {e.message}"
         
         # Build success message
         guest_name = reservation_data.get('guestName', 'N/A')
@@ -960,6 +1068,7 @@ async def perform_api_checkin(query, context, reservation_id: str):
             f"🏠 {unit_name}\n"
             f"📅 {arrival} → {departure}\n\n"
             f"**Prijavljeni gosti:**{guest_summary}"
+            f"{checkin_status}"
             f"{msg_text}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -1469,6 +1578,7 @@ async def setup_bot_commands(app: Application):
         BotCommand("today", "Današnji dolasci"),
         BotCommand("tomorrow", "Sutrašnji dolasci"),
         BotCommand("checkouts", "Odlasci danas/sutra"),
+        BotCommand("cleaning", "🧹 Raspored čišćenja (7 dana)"),
         BotCommand("upcoming", "Dolasci sljedećih 7 dana"),
         BotCommand("week", "📊 Tjedna statistika"),
         BotCommand("search", "Pretraži po imenu gosta"),
@@ -1776,6 +1886,7 @@ def main():
     app.add_handler(CommandHandler("today", today_arrivals))
     app.add_handler(CommandHandler("tomorrow", tomorrow_arrivals))
     app.add_handler(CommandHandler("checkouts", checkouts_command))
+    app.add_handler(CommandHandler("cleaning", cleaning_schedule))
     app.add_handler(CommandHandler("current", current_guests))
     app.add_handler(CommandHandler("week", week_stats))
     app.add_handler(CommandHandler("search", search_guest))
