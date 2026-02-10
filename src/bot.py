@@ -973,11 +973,10 @@ async def perform_api_checkin(query, context, reservation_id: str):
     )
     
     try:
-        # Phase 1: Build guest data and add via POST
-        # NOTE: POST /reservations-guests only supports basic fields.
-        # documentNumber, travelDocumentTypesId etc. require a separate PUT update.
+        # Build guest data and add via single POST
+        # The API accepts documentNumber/travelDocumentTypesId even though
+        # the official schema doesn't list them — do NOT split into POST+PUT.
         api_guests = []
-        guest_extra_data = []  # Store doc fields for PUT update
         
         for i, guest in enumerate(guests):
             # Build full name
@@ -993,7 +992,7 @@ async def perform_api_checkin(query, context, reservation_id: str):
             if guest.nationality:
                 country_id = country_mapper.get_country_id(guest.nationality)
             
-            # Build guest object with fields supported by POST
+            # Build guest object with ALL available fields
             api_guest = {
                 "name": name,
                 "isBooker": "N",
@@ -1021,6 +1020,19 @@ async def perform_api_checkin(query, context, reservation_id: str):
                 api_guest["countryOfBirthId"] = country_id
                 api_guest["countryOfResidenceId"] = country_id
             
+            # Document number + type
+            if guest.document_number:
+                api_guest["documentNumber"] = str(guest.document_number)
+            doc_type = getattr(guest, 'document_type', None)
+            if doc_type:
+                doc_type_id = _get_document_type_id(doc_type, guest.nationality)
+                if doc_type_id:
+                    api_guest["travelDocumentTypesId"] = str(doc_type_id)
+            
+            # eVisitor fields
+            api_guest["arrivalArrangementsId"] = "1"   # Personal
+            api_guest["providedServicesTypesId"] = "1"  # Default
+            
             # City of residence
             if guest.place_of_residence:
                 api_guest["cityOfResidence"] = guest.place_of_residence
@@ -1029,7 +1041,7 @@ async def perform_api_checkin(query, context, reservation_id: str):
             if hasattr(guest, 'address') and guest.address:
                 api_guest["address"] = guest.address
             
-            # Build note with document info
+            # Build note with document info as backup
             note_parts = []
             if guest.document_number:
                 note_parts.append(f"Doc: {guest.document_number}")
@@ -1040,55 +1052,13 @@ async def perform_api_checkin(query, context, reservation_id: str):
             if note_parts:
                 api_guest["note"] = " | ".join(note_parts)
             
-            # Collect extra data for PUT update (not supported by POST)
-            extra = {}
-            if guest.document_number:
-                extra["documentNumber"] = guest.document_number
-            doc_type = getattr(guest, 'document_type', None)
-            if doc_type:
-                doc_type_id = _get_document_type_id(doc_type, guest.nationality)
-                if doc_type_id:
-                    extra["travelDocumentTypesId"] = doc_type_id
-            # Default eVisitor fields for Croatian guests
-            if country_id == 53:  # Croatia
-                extra.setdefault("arrivalArrangementsId", 1)   # Personal
-                extra.setdefault("providedServicesTypesId", 1)  # Default service
-            guest_extra_data.append(extra)
-            
-            logger.info(f"Guest {i+1} POST data: {api_guest}")
-            logger.info(f"Guest {i+1} extra (for PUT): {extra}")
+            logger.info(f"Guest {i+1} API data: {api_guest}")
             api_guests.append(api_guest)
         
-        # Phase 1: POST - Add guests (basic fields)
+        # Add guests (single POST with all fields)
         result = await api.add_reservation_guests(reservation_id, api_guests)
         added = result.get('guestAdded', [])
         messages = result.get('messages', [])
-        logger.info(f"Add guests result: added={added}, messages={messages}")
-        
-        # Phase 2: PUT - Update added guests with document fields
-        if added:
-            update_guests = []
-            for i, guest_id in enumerate(added):
-                if i < len(guest_extra_data) and guest_extra_data[i]:
-                    update_obj = {
-                        "id": guest_id,
-                        "name": api_guests[i]["name"],  # name is required
-                        **guest_extra_data[i],
-                    }
-                    update_guests.append(update_obj)
-            
-            if update_guests:
-                try:
-                    update_result = await api.update_reservation_guests(reservation_id, update_guests)
-                    updated = update_result.get('guestUpdated', [])
-                    update_msgs = update_result.get('messages', [])
-                    logger.info(f"Update guests result: updated={updated}, messages={update_msgs}")
-                    if update_msgs:
-                        messages.extend(update_msgs)
-                except Exception as e:
-                    logger.warning(f"Guest update (document fields) failed: {e}")
-                    messages.append(f"Dokument polja: potreban ručni unos")
-        
         logger.info(f"Add guests result: added={added}, messages={messages}")
         
         # If guests were added/exist, mark reservation as checked-in

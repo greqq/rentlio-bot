@@ -91,9 +91,20 @@ class RentlioAPI:
                 response_data = await response.json()
                 
                 if response.status >= 400:
+                    # Extract error message from various formats
+                    msg = response_data.get("message", "")
+                    if not msg:
+                        errors = response_data.get("errors", {})
+                        if isinstance(errors, dict):
+                            msg = errors.get("global", str(errors))
+                        else:
+                            msg = str(errors)
+                    if not msg:
+                        msg = str(response_data)
+                    logger.error(f"API Error {response.status}: {msg} | Full response: {response_data}")
                     raise RentlioAPIError(
                         status_code=response.status,
-                        message=response_data.get("message", "Unknown error"),
+                        message=msg,
                         response_data=response_data
                     )
                 
