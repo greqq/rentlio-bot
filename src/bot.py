@@ -418,11 +418,25 @@ async def cleaning_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         text = f"🧹 **Raspored čišćenja - sljedećih 7 dana**\n\n"
         
+        # Croatian full day names
+        CROATIAN_DAYS = {
+            0: "Ponedjeljak", 1: "Utorak", 2: "Srijeda",
+            3: "Četvrtak", 4: "Petak", 5: "Subota", 6: "Nedjelja"
+        }
+
+        # Apartment codes
+        APARTMENT_CODES = {
+            "Sunset": 1,
+            "Sunrise": 2,
+        }
+
         # Group by date
         from collections import defaultdict
         by_date = defaultdict(list)
         for res in departures:
-            departure_date = datetime.fromtimestamp(res.get("departureDate", 0)).strftime("%d.%m (%a)")
+            dt = datetime.fromtimestamp(res.get("departureDate", 0))
+            day_name = CROATIAN_DAYS.get(dt.weekday(), "")
+            departure_date = dt.strftime("%d.%m") + f" ({day_name})"
             by_date[departure_date].append(res)
         
         # Get sorted dates
@@ -438,7 +452,9 @@ async def cleaning_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 unit_groups[unit].append(res)
             
             for unit in sorted(unit_groups.keys()):
-                text += f"  🏠 {unit}\n"
+                code = APARTMENT_CODES.get(unit)
+                unit_label = f"{unit} ({code})" if code else unit
+                text += f"  🏠 {unit_label}\n"
                 for res in unit_groups[unit]:
                     guest = res.get("guestName", "Unknown")
                     text += f"    • {guest}\n"
