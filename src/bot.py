@@ -1866,15 +1866,19 @@ async def send_monthly_cleaning_reminder(context: ContextTypes.DEFAULT_TYPE):
     """Send monthly reminder to restock dishwasher supplies"""
     logger.info("Sending monthly cleaning supplies reminder...")
     text = (
-        "🧹 *Mjesečni podsjetnik - Čišćenje*\n\n"
-        "Nadopunit perilicu, tekućinu, i sol\\. I nadopuniti Sol i Šećer,"
+        "🧹 *Mjesečni podsjetnik — Nadopunjavanje*\n\n"
+        "Provjeri i nadopuni sljedeće:\n\n"
+        "• 🫧 Tekućina za sjaj u perilici\n"
+        "• 🧂 Sol u perilici\n"
+        "• 🧂 Sol u kuhinji\n"
+        "• 🍬 Šećer u kuhinji"
     )
     for user_id in config.TELEGRAM_ALLOWED_USERS:
         try:
             await context.bot.send_message(
                 chat_id=user_id,
                 text=text,
-                parse_mode="MarkdownV2"
+                parse_mode="Markdown"
             )
             logger.info(f"Sent monthly cleaning reminder to user {user_id}")
         except Exception as e:
