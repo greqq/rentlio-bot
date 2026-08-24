@@ -29,7 +29,20 @@ import aiohttp
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.config import config
+try:
+    from src.config import config
+except ModuleNotFoundError:  # standalone use, outside a repo checkout
+    import os
+    from types import SimpleNamespace
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ModuleNotFoundError:
+        pass
+    config = SimpleNamespace(
+        RENTLIO_API_KEY=os.getenv("RENTLIO_API_KEY", ""),
+        RENTLIO_API_URL=os.getenv("RENTLIO_API_URL", "https://api.rentl.io/v1"),
+    )
 
 # Fields the bot already knows about. Anything the API returns that is NOT in
 # here gets flagged as "NEW" - that is the interesting part of the report.
