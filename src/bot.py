@@ -33,7 +33,12 @@ from telegram.ext import (
 )
 
 from src.config import config
-from src.services.rentlio_api import RentlioAPI, RentlioAPIError
+from src.services.rentlio_api import (
+    RentlioAPI,
+    RentlioAPIError,
+    is_checked_in,
+    is_live_reservation,
+)
 from src.services.ocr_service import ocr_service, ExtractedGuestData
 from src.services.country_mapper import country_mapper
 
@@ -69,7 +74,7 @@ def format_reservation(res: dict, detailed: bool = False) -> str:
     children = res.get("childrenUnder12", 0) + res.get("childrenAbove12", 0)
     total_price = res.get("totalPrice", 0)
     currency = "EUR"  # Assuming EUR
-    status = "✅" if res.get("checkedIn") == "Y" else "⏳"
+    status = "✅" if is_checked_in(res) else "⏳"
     channel = res.get("otaChannelName", "Direct")
     
     text = f"""
@@ -153,10 +158,9 @@ async def upcoming_reservations(update: Update, context: ContextTypes.DEFAULT_TY
             limit=50
         )
         
-        # Filter to only confirmed reservations (status=1) and arrivals in next 7 days
-        CONFIRMED_STATUS = 1
+        # Keep every live reservation; only refused/cancelled/deleted are dropped
         arrivals = [r for r in all_reservations 
-                   if r.get("status") == CONFIRMED_STATUS and today_ts <= r.get("arrivalDate", 0) <= week_ts]
+                   if is_live_reservation(r) and today_ts <= r.get("arrivalDate", 0) <= week_ts]
         
         if not arrivals:
             await update.message.reply_text("📭 Nema dolazaka u sljedećih 7 dana.")
@@ -222,10 +226,9 @@ async def today_arrivals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             limit=50
         )
         
-        # Filter to confirmed arrivals today only (status=1)
-        CONFIRMED_STATUS = 1
+        # Keep every live reservation; only refused/cancelled/deleted are dropped
         arrivals = [r for r in reservations 
-                   if r.get("status") == CONFIRMED_STATUS and today_ts_start <= r.get("arrivalDate", 0) <= today_ts_end]
+                   if is_live_reservation(r) and today_ts_start <= r.get("arrivalDate", 0) <= today_ts_end]
         
         if not arrivals:
             await update.message.reply_text(f"📭 Nema dolazaka danas ({today_display}).")
@@ -280,10 +283,9 @@ async def tomorrow_arrivals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             limit=50
         )
         
-        # Filter to confirmed arrivals tomorrow only (status=1)
-        CONFIRMED_STATUS = 1
+        # Keep every live reservation; only refused/cancelled/deleted are dropped
         arrivals = [r for r in reservations 
-                   if r.get("status") == CONFIRMED_STATUS and tomorrow_ts_start <= r.get("arrivalDate", 0) <= tomorrow_ts_end]
+                   if is_live_reservation(r) and tomorrow_ts_start <= r.get("arrivalDate", 0) <= tomorrow_ts_end]
         
         if not arrivals:
             await update.message.reply_text(f"📭 Nema dolazaka sutra ({tomorrow_display}).")
@@ -345,9 +347,8 @@ async def checkouts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             limit=50
         )
         
-        # Filter confirmed only (status=1)
-        CONFIRMED_STATUS = 1
-        reservations = [r for r in reservations if r.get("status") == CONFIRMED_STATUS]
+        # Keep every live reservation; only refused/cancelled/deleted are dropped
+        reservations = [r for r in reservations if is_live_reservation(r)]
         
         today_departures = [r for r in reservations 
                           if today_ts_start <= r.get("departureDate", 0) <= today_ts_end]
@@ -404,10 +405,9 @@ async def cleaning_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
             limit=100
         )
         
-        # Filter confirmed departures in next 7 days (status=1)
-        CONFIRMED_STATUS = 1
+        # Keep every live reservation; only refused/cancelled/deleted are dropped
         departures = [r for r in reservations 
-                     if r.get("status") == CONFIRMED_STATUS and today_ts <= r.get("departureDate", 0) <= week_ts]
+                     if is_live_reservation(r) and today_ts <= r.get("departureDate", 0) <= week_ts]
         
         if not departures:
             await update.message.reply_text("📭 Nema odlazaka u sljedećih 7 dana.")
@@ -488,12 +488,11 @@ async def current_guests(update: Update, context: ContextTypes.DEFAULT_TYPE):
             limit=50
         )
         
-        # Filter to confirmed reservations currently staying
-        CONFIRMED_STATUS = 1
+        # Keep every live reservation; only refused/cancelled/deleted are dropped
         today_date = today.date()
         current = []
         for r in reservations:
-            if r.get("status") != CONFIRMED_STATUS:
+            if not is_live_reservation(r):
                 continue
             arrival = r.get("arrivalDate", 0)
             departure = r.get("departureDate", 0)
@@ -572,9 +571,8 @@ async def week_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             limit=100
         )
         
-        # Filter confirmed only
-        CONFIRMED_STATUS = 1
-        reservations = [r for r in reservations if r.get("status") == CONFIRMED_STATUS]
+        # Keep every live reservation; only refused/cancelled/deleted are dropped
+        reservations = [r for r in reservations if is_live_reservation(r)]
         
         # Get unique units
         units = set()
@@ -852,9 +850,8 @@ async def show_reservation_selection(query, context):
             limit=20
         )
         
-        # Filter to confirmed only (status=1)
-        CONFIRMED_STATUS = 1
-        reservations = [r for r in reservations if r.get('status') == CONFIRMED_STATUS]
+        # Keep every live reservation; only refused/cancelled/deleted are dropped
+        reservations = [r for r in reservations if is_live_reservation(r)]
         
         if not reservations:
             await query.edit_message_text(
@@ -879,7 +876,7 @@ async def show_reservation_selection(query, context):
             unit_name = res.get('unitName', '')[:10]
             arrival = format_date(res.get('arrivalDate', 0))
             nights = res.get('totalNights', 0)
-            checked_in = "✅" if res.get('checkedIn') == 'Y' else "⏳"
+            checked_in = "✅" if is_checked_in(res) else "⏳"
             
             btn_text = f"{checked_in} {guest_name} | {unit_name} | {arrival}"
             keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"checkin_res_{res_id}")])
@@ -942,8 +939,9 @@ def convert_gender_to_id(gender: str) -> Optional[int]:
     return None
 
 
-# Direct mapping: (document_type, is_croatian) -> Rentlio travelDocumentTypesId
-# IDs from /enums/guests/document-types
+# Direct mapping: (document_type, is_croatian) -> eVisitorDocumentTypeId.
+# IDs from /enums/guests/document-types; verified against a reservation
+# registered through Rentlio's own UI, which stores 25 for a Croatian ID card.
 _DOCUMENT_TYPE_IDS = {
     ("ID_CARD", True): 25,       # Personal ID card (Croatian)
     ("ID_CARD", False): 23,      # Personal ID card (foreign)
@@ -960,7 +958,7 @@ def _get_document_type_id(doc_type: str, nationality: str = None) -> Optional[in
         nationality: Guest nationality string
     
     Returns:
-        Rentlio travelDocumentTypesId or None
+        eVisitorDocumentTypeId or None
     """
     if not doc_type:
         return None
@@ -971,6 +969,45 @@ def _get_document_type_id(doc_type: str, nationality: str = None) -> Optional[in
         type_id = _DOCUMENT_TYPE_IDS.get((doc_type, False))
     logger.info(f"Document type mapping: {doc_type}, croatian={is_croatian} -> id={type_id}")
     return type_id
+
+
+# Tourist tax categories from /enums/guests/tax-categories. eVisitor splits
+# guests by age; a reservation registered through Rentlio's UI stores 3 for an
+# adult.
+TAX_CATEGORY_ADULT = 3          # Tourist staying in a property
+TAX_CATEGORY_CHILD_12_TO_18 = 4  # Children: between 12 and 18 years
+TAX_CATEGORY_CHILD_UNDER_12 = 7  # Children up to 12 years
+
+
+def _get_tourist_tax_category(date_of_birth: str) -> int:
+    """Pick the eVisitor tourist tax category from the guest's date of birth.
+
+    Falls back to the adult category when the date is missing or unparseable -
+    charging tourist tax that may not be due is recoverable, omitting a guest
+    from eVisitor is not.
+    """
+    if not date_of_birth:
+        return TAX_CATEGORY_ADULT
+
+    born = None
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            born = datetime.strptime(date_of_birth, fmt)
+            break
+        except ValueError:
+            continue
+    if born is None:
+        logger.warning(f"Unparseable date of birth {date_of_birth!r}, assuming adult")
+        return TAX_CATEGORY_ADULT
+
+    today = datetime.now()
+    age = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+
+    if age < 12:
+        return TAX_CATEGORY_CHILD_UNDER_12
+    if age < 18:
+        return TAX_CATEGORY_CHILD_12_TO_18
+    return TAX_CATEGORY_ADULT
 
 
 async def perform_api_checkin(query, context, reservation_id: str):
@@ -991,8 +1028,8 @@ async def perform_api_checkin(query, context, reservation_id: str):
     try:
         # Phase 1: POST — create guests with basic fields only
         # The /reservations-guests/ POST schema only supports basic fields.
-        # Document fields (documentNumber, travelDocumentTypesId, etc.) must
-        # be set via a separate PUT call after the guest is created.
+        # Document and eVisitor fields must be set via a separate PUT once the
+        # guest exists and has an id.
         api_guests = []
         guest_doc_data = []  # Store doc-related fields for Phase 2 PUT
         
@@ -1069,9 +1106,12 @@ async def perform_api_checkin(query, context, reservation_id: str):
             if doc_type:
                 doc_type_id = _get_document_type_id(doc_type, guest.nationality)
                 if doc_type_id:
-                    doc_fields["travelDocumentTypesId"] = str(doc_type_id)
-            doc_fields["arrivalArrangementsId"] = "1"   # Personal
-            doc_fields["providedServicesTypesId"] = "1"  # Accommodation
+                    doc_fields["eVisitorDocumentTypeId"] = doc_type_id
+            doc_fields["arrivalArrangementId"] = 2   # Personal (1 is Agency)
+            doc_fields["providedServicesTypeId"] = 1  # Accommodation
+            doc_fields["eVisitorTouristTaxCategoryId"] = _get_tourist_tax_category(
+                guest.date_of_birth
+            )
             guest_doc_data.append(doc_fields)
             
             logger.info(f"Guest {i+1} POST data: {api_guest}")
@@ -1092,8 +1132,8 @@ async def perform_api_checkin(query, context, reservation_id: str):
             for i, guest_id in enumerate(added):
                 if i >= len(api_guests) or i >= len(guest_doc_data):
                     break
-                if not guest_doc_data[i].get("documentNumber"):
-                    continue  # No doc data to update
+                if not guest_doc_data[i]:
+                    continue  # Nothing to update
                 
                 update_obj = {
                     "id": guest_id,
@@ -1120,23 +1160,33 @@ async def perform_api_checkin(query, context, reservation_id: str):
                     logger.error(f"PUT update failed: {e}")
                     messages.append("⚠️ Dokument polja: potreban ručni unos")
         
-        # Verify: fetch guest data back to confirm document fields were saved
-        # Use the old endpoint which returns documentNumber, travelDocumentTypesId etc.
+        # Verify against the same endpoint we wrote to, so a field that did not
+        # stick shows up here instead of surfacing weeks later in eVisitor.
+        REQUIRED_FOR_EVISITOR = (
+            "documentNumber",
+            "eVisitorDocumentTypeId",
+            "eVisitorTouristTaxCategoryId",
+            "dateOfBirth",
+        )
         try:
-            verify_response = await api._request(
-                "GET", f"/reservations/{reservation_id}/guests"
-            )
-            holder = verify_response.get('holder', {})
-            logger.info(
-                f"Verify holder: name={holder.get('name')}, "
-                f"documentNumber={holder.get('documentNumber')}, "
-                f"travelDocumentTypesId={holder.get('travelDocumentTypesId')}, "
-                f"arrivalArrangementsId={holder.get('arrivalArrangementsId')}, "
-                f"providedServicesTypesId={holder.get('providedServicesTypesId')}, "
-                f"cityOfResidence={holder.get('cityOfResidence')}"
-            )
+            saved = await api.get_reservation_guests_v2(reservation_id)
+            incomplete = []
+            for g in saved:
+                missing = [f for f in REQUIRED_FOR_EVISITOR if not g.get(f)]
+                logger.info(
+                    f"Verify guest {g.get('id')}: "
+                    + ", ".join(f"{f}={g.get(f)}" for f in REQUIRED_FOR_EVISITOR)
+                    + f", arrivalArrangementId={g.get('arrivalArrangementId')}"
+                    + f", providedServicesTypeId={g.get('providedServicesTypeId')}"
+                )
+                if missing:
+                    incomplete.append(f"{g.get('name', g.get('id'))}: {', '.join(missing)}")
+
+            if incomplete:
+                messages.append("⚠️ Nedostaje za eVisitor — " + " | ".join(incomplete))
         except Exception as e:
             logger.warning(f"Verify GET failed: {e}")
+            messages.append("⚠️ Nisam mogao provjeriti spremljene podatke")
         
         # If guests were added/exist, mark reservation as checked-in
         checkin_status = ""
@@ -1724,10 +1774,8 @@ async def get_daily_summary() -> tuple[list, list, list]:
         limit=100
     )
     
-    # Filter to only confirmed reservations (status=1)
-    # Status 5 = cancelled/blocked, we don't want those
-    CONFIRMED_STATUS = 1
-    all_reservations = [r for r in all_reservations if r.get("status") == CONFIRMED_STATUS]
+    # Keep every live reservation; only refused/cancelled/deleted are dropped
+    all_reservations = [r for r in all_reservations if is_live_reservation(r)]
     
     arrivals = []
     departures = []

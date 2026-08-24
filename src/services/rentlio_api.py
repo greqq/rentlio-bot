@@ -9,6 +9,38 @@ from src.config import config
 
 logger = logging.getLogger(__name__)
 
+# Reservation statuses, from GET /enums/reservations/statuses.
+# The bot previously assumed 1/2/3 = confirmed/tentative/cancelled, which is
+# wrong: 3 is "Refused" and cancellations are 5. Statuses 8 and 9 are set by
+# the check-in / check-out endpoints, so a reservation the bot itself checked
+# in is no longer status 1.
+RESERVATION_STATUSES = {
+    1: "confirmed",
+    2: "waiting_for_approval",
+    3: "refused",
+    4: "accepted",
+    5: "cancelled",
+    6: "deleted_with_penalty",
+    7: "option",
+    8: "in_house",
+    9: "departed",
+}
+
+# Statuses that mean "this stay is not happening". Everything else is a real
+# reservation that should stay visible, including ones already checked in.
+DEAD_STATUSES = frozenset({3, 5, 6})
+
+
+def is_live_reservation(reservation: dict) -> bool:
+    """True unless the reservation was refused, cancelled or deleted."""
+    return reservation.get("status") not in DEAD_STATUSES
+
+
+def is_checked_in(reservation: dict) -> bool:
+    """True once check-in has been made (status 8), before check-out."""
+    return reservation.get("status") == 8
+
+
 
 @dataclass
 class RentlioReservation:
@@ -480,12 +512,7 @@ class RentlioAPI:
     @staticmethod
     def _status_code_to_string(status: int) -> str:
         """Convert status code to string"""
-        status_map = {
-            1: "confirmed",
-            2: "tentative",
-            3: "cancelled"
-        }
-        return status_map.get(status, "unknown")
+        return RESERVATION_STATUSES.get(status, "unknown")
 
 
 # Singleton instance
