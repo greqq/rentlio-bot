@@ -10,6 +10,7 @@ Supports:
 """
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Optional, List
 from google.cloud import vision
@@ -36,6 +37,44 @@ COUNTRY_CODES = {
     'GBR': 'Ujedinjeno Kraljevstvo',
     'FRA': 'Francuska',
 }
+
+
+# Latin letters that carry no combining mark to strip, so NFKD leaves them
+# alone. ICAO 9303 maps them to these ASCII forms in the MRZ.
+_ICAO_SPECIAL = {
+    "Đ": "D", "đ": "d", "Ð": "D", "ð": "d",
+    "Ø": "O", "ø": "o", "Ł": "L", "ł": "l",
+    "Æ": "AE", "æ": "ae", "Œ": "OE", "œ": "oe",
+    "ß": "ss", "Þ": "TH", "þ": "th",
+}
+
+
+def strip_diacritics(text: str) -> str:
+    """Reduce text to the ASCII form the MRZ would use.
+
+    Mašanović -> Masanovic. This is one-way: the MRZ cannot tell us where the
+    diacritics belong (Sanja and Šanja both write as SANJA), which is why the
+    correct spelling has to come from the visual side of the document.
+    """
+    out = []
+    for ch in text:
+        if ch in _ICAO_SPECIAL:
+            out.append(_ICAO_SPECIAL[ch])
+            continue
+        out.append("".join(
+            c for c in unicodedata.normalize("NFKD", ch)
+            if not unicodedata.combining(c)
+        ))
+    return "".join(out)
+
+
+def _mrz_equivalent(word: str) -> str:
+    """Normalised form used to match a visual word against an MRZ name.
+
+    Đ is transliterated as D on Croatian documents but as DJ elsewhere, so
+    both collapse to the same key.
+    """
+    return strip_diacritics(word).upper().replace("DJ", "D")
 
 
 @dataclass
@@ -181,6 +220,11 @@ class OCRService:
         if mrz_data.is_valid():
             logger.info("Extracted data from MRZ")
             mrz_data.extraction_method = "MRZ"
+            # The MRZ is ASCII-only by standard, so names come out stripped of
+            # diacritics. The printed side of the document has them - recover
+            # the real spelling from there.
+            self._restore_diacritics(mrz_data, text)
+
             # Also try to get residence from visual text (not in MRZ)
             city, address = self._extract_residence(text)
             logger.info(f"Residence extraction: city={city}, address={address}")
@@ -202,6 +246,39 @@ class OCRService:
         generic_data.extraction_method = "Generic"
         return generic_data
     
+    def _restore_diacritics(self, data: ExtractedGuestData, text: str) -> None:
+        """Replace MRZ-transliterated names with their printed spelling."""
+        words = re.findall(r"[^\W\d_]+", text, re.UNICODE)
+
+        # Index by MRZ-equivalent form. Prefer a spelling that actually carries
+        # diacritics, so "MASANOVIC" printed in the MRZ line itself does not
+        # win over "Mašanović" printed above it.
+        by_key: dict = {}
+        for word in words:
+            if len(word) < 2:
+                continue
+            key = _mrz_equivalent(word)
+            current = by_key.get(key)
+            if current is None or (strip_diacritics(word) != word
+                                   and strip_diacritics(current) == current):
+                by_key[key] = word
+
+        changed = False
+        for field in ("first_name", "last_name"):
+            value = getattr(data, field, None)
+            if not value:
+                continue
+            match = by_key.get(_mrz_equivalent(value))
+            if match and strip_diacritics(match) != match:
+                setattr(data, field, match.title())
+                changed = True
+
+        if changed:
+            data.full_name = " ".join(
+                part for part in (data.first_name, data.last_name) if part
+            )
+            logger.info(f"Restored spelling from visual zone: {data.full_name}")
+
     def _parse_mrz(self, text: str) -> ExtractedGuestData:
         """
         Parse MRZ (Machine Readable Zone) from ID card
@@ -450,8 +527,9 @@ class OCRService:
                 if any(lbl in next_line.upper() for lbl in ['IZDALA', 'ISSUED', 'DATUM', 'OIB', 'MBG']):
                     continue
                 if next_line:
-                    # Format: "LADIMIREVCI, VALPOVO" - take the full city string
-                    city = next_line.title()
+                    # Printed as "settlement, municipality" (e.g. "OSIJEK,
+                    # OSIJEK"). Rentlio wants only the settlement.
+                    city = next_line.split(",")[0].strip().title()
                     # Check for address on the line after
                     if i + 2 < len(lines):
                         addr_line = lines[i + 2].strip()
