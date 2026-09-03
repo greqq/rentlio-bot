@@ -39,7 +39,7 @@ from src.services.rentlio_api import (
     is_checked_in,
     is_live_reservation,
 )
-from src.services.ocr_service import ocr_service, ExtractedGuestData
+from src.services.ocr_service import ocr_service, ExtractedGuestData, strip_diacritics
 from src.services.country_mapper import country_mapper
 
 # Setup logging
@@ -1010,6 +1010,37 @@ def _get_tourist_tax_category(date_of_birth: str) -> int:
     return TAX_CATEGORY_ADULT
 
 
+def _name_key(name: str) -> str:
+    """Comparable form of a guest name.
+
+    OCR gives "DORA MASANOVIC", Rentlio may hold "Dora Mašanović", and a
+    booking channel may put the surname first. Compare on sorted, accent-free,
+    lowercase words so all three land on the same key.
+    """
+    if not name:
+        return ""
+    words = re.findall(r"[^\W\d_]+", strip_diacritics(name).lower(), re.UNICODE)
+    return " ".join(sorted(words))
+
+
+def _match_existing_guest(guest, existing: list) -> Optional[dict]:
+    """Find the guest already on the reservation, if this is the same person.
+
+    Booking channels put the holder on the reservation before anyone scans a
+    document, so the common case is that the person we just read from an ID is
+    already there with empty fields. Adding them again is what produced
+    duplicate registrations.
+    """
+    name = guest.full_name or f"{guest.first_name or ''} {guest.last_name or ''}"
+    key = _name_key(name)
+    if not key:
+        return None
+    for candidate in existing:
+        if _name_key(candidate.get("name", "")) == key:
+            return candidate
+    return None
+
+
 async def perform_api_checkin(query, context, reservation_id: str):
     """Perform the actual API check-in"""
     guests = context.user_data.get('checkin_guests', [])
@@ -1026,13 +1057,27 @@ async def perform_api_checkin(query, context, reservation_id: str):
     )
     
     try:
-        # Phase 1: POST — create guests with basic fields only
-        # The /reservations-guests/ POST schema only supports basic fields.
-        # Document and eVisitor fields must be set via a separate PUT once the
-        # guest exists and has an id.
+        # A channel booking already carries its holder, so scanning that
+        # person's ID and blindly POSTing them added the same human twice.
+        # Read what is there first and update in place where it is the same
+        # person.
+        existing_guests = []
+        try:
+            existing_guests = await api.get_reservation_guests_v2(reservation_id)
+        except Exception as e:
+            logger.warning(f"Could not read existing guests, treating all as new: {e}")
+        has_primary = any(g.get("isPrimary") == "Y" for g in existing_guests)
+        logger.info(
+            f"Reservation {reservation_id} already has {len(existing_guests)} guest(s), "
+            f"primary present: {has_primary}"
+        )
+
+        # Only guests without a match are POSTed; document and eVisitor fields
+        # always go through a PUT, which needs the guest to have an id.
         api_guests = []
-        guest_doc_data = []  # Store doc-related fields for Phase 2 PUT
-        
+        guest_doc_data = []
+        guest_ids = []  # existing id per guest, or None until POST assigns one
+
         for i, guest in enumerate(guests):
             # Build full name
             name = guest.full_name
@@ -1047,17 +1092,30 @@ async def perform_api_checkin(query, context, reservation_id: str):
             if guest.nationality:
                 country_id = country_mapper.get_country_id(guest.nationality)
             
-            # Role flags
-            is_primary = "Y" if i == 0 else "N"
-            is_additional = "N" if i == 0 else "Y"
-            
-            # Build guest object with fields supported by POST
-            api_guest = {
-                "name": name,
-                "isBooker": "N",
-                "isPrimary": is_primary,
-                "isAdditional": is_additional,
-            }
+            matched = _match_existing_guest(guest, existing_guests)
+            if matched:
+                # Keep the role the reservation already assigned - overwriting
+                # a booker or primary flag would reshuffle the reservation.
+                roles = {
+                    "isBooker": matched.get("isBooker") or "N",
+                    "isPrimary": matched.get("isPrimary") or "N",
+                    "isAdditional": matched.get("isAdditional") or "N",
+                }
+                guest_ids.append(matched.get("id"))
+                logger.info(f"Guest {i+1} ({name}) matches existing guest {matched.get('id')}")
+            else:
+                # Only one guest can be primary; if the reservation already has
+                # one, everyone we add is an additional guest.
+                takes_primary = not has_primary
+                has_primary = has_primary or takes_primary
+                roles = {
+                    "isBooker": "N",
+                    "isPrimary": "Y" if takes_primary else "N",
+                    "isAdditional": "N" if takes_primary else "Y",
+                }
+                guest_ids.append(None)
+
+            api_guest = {"name": name, **roles}
             
             # Date of birth (UTC midnight to avoid timezone off-by-one)
             if guest.date_of_birth:
@@ -1118,47 +1176,53 @@ async def perform_api_checkin(query, context, reservation_id: str):
             logger.info(f"Guest {i+1} doc fields (for PUT): {doc_fields}")
             api_guests.append(api_guest)
         
-        # Phase 1: POST - create guests
-        result = await api.add_reservation_guests(reservation_id, api_guests)
-        added = result.get('guestAdded', [])
-        messages = result.get('messages', [])
-        logger.info(f"POST result: added={added}, messages={messages}")
-        
-        # Phase 2: PUT - update created guests with document fields
-        # Previous PUT failed with 400 because isBooker/isPrimary/isAdditional
-        # were missing. Include ALL required fields this time.
-        if added:
-            update_guests = []
-            for i, guest_id in enumerate(added):
-                if i >= len(api_guests) or i >= len(guest_doc_data):
-                    break
-                if not guest_doc_data[i]:
-                    continue  # Nothing to update
-                
-                update_obj = {
-                    "id": guest_id,
-                    "name": api_guests[i]["name"],
-                    "isBooker": api_guests[i]["isBooker"],
-                    "isPrimary": api_guests[i]["isPrimary"],
-                    "isAdditional": api_guests[i]["isAdditional"],
-                    **guest_doc_data[i],
-                }
-                update_guests.append(update_obj)
-                logger.info(f"Guest {i+1} PUT data: {update_obj}")
-            
-            if update_guests:
-                try:
-                    update_result = await api.update_reservation_guests(
-                        reservation_id, update_guests
-                    )
-                    updated_ids = update_result.get('guestUpdated', [])
-                    update_msgs = update_result.get('messages', [])
-                    logger.info(f"PUT result: updated={updated_ids}, messages={update_msgs}")
-                    if update_msgs:
-                        messages.extend(update_msgs)
-                except Exception as e:
-                    logger.error(f"PUT update failed: {e}")
-                    messages.append("⚠️ Dokument polja: potreban ručni unos")
+        messages = []
+        added = []
+
+        # Phase 1: POST - create only the guests not already on the reservation
+        new_indices = [i for i, gid in enumerate(guest_ids) if gid is None]
+        if new_indices:
+            result = await api.add_reservation_guests(
+                reservation_id, [api_guests[i] for i in new_indices]
+            )
+            added = result.get('guestAdded', [])
+            messages = list(result.get('messages', []))
+            logger.info(f"POST result: added={added}, messages={messages}")
+            for slot, new_id in zip(new_indices, added):
+                guest_ids[slot] = new_id
+            if len(added) != len(new_indices):
+                logger.warning(
+                    f"POSTed {len(new_indices)} guest(s) but got {len(added)} id(s) back"
+                )
+        else:
+            logger.info("Every guest already existed on the reservation - nothing to POST")
+
+        # Phase 2: PUT - document and eVisitor fields, for matched and new alike
+        update_guests = []
+        for i, guest_id in enumerate(guest_ids):
+            if guest_id is None or not guest_doc_data[i]:
+                continue
+            update_obj = {
+                "id": guest_id,
+                **api_guests[i],
+                **guest_doc_data[i],
+            }
+            update_guests.append(update_obj)
+            logger.info(f"Guest {i+1} PUT data: {update_obj}")
+
+        if update_guests:
+            try:
+                update_result = await api.update_reservation_guests(
+                    reservation_id, update_guests
+                )
+                updated_ids = update_result.get('guestUpdated', [])
+                update_msgs = update_result.get('messages', [])
+                logger.info(f"PUT result: updated={updated_ids}, messages={update_msgs}")
+                if update_msgs:
+                    messages.extend(update_msgs)
+            except Exception as e:
+                logger.error(f"PUT update failed: {e}")
+                messages.append("⚠️ Dokument polja: potreban ručni unos")
         
         # Verify against the same endpoint we wrote to, so a field that did not
         # stick shows up here instead of surfacing weeks later in eVisitor.
@@ -1188,9 +1252,10 @@ async def perform_api_checkin(query, context, reservation_id: str):
             logger.warning(f"Verify GET failed: {e}")
             messages.append("⚠️ Nisam mogao provjeriti spremljene podatke")
         
-        # If guests were added/exist, mark reservation as checked-in
+        # Mark checked-in once every guest is on the reservation, whether we
+        # created them or updated one that was already there.
         checkin_status = ""
-        if added or messages:  # Even if guests existed already, try checkin
+        if any(guest_ids):
             try:
                 checkin_result = await api.checkin_reservation(reservation_id)
                 logger.info(f"Checkin result: {checkin_result}")
@@ -1210,13 +1275,13 @@ async def perform_api_checkin(query, context, reservation_id: str):
         for i, guest in enumerate(guests):
             name = guest.full_name or f"{guest.first_name} {guest.last_name}".strip()
             country = guest.nationality or "N/A"
-            success = "✅" if (i < len(added)) else "⚠️"
+            success = "✅" if guest_ids[i] else "⚠️"
             guest_summary += f"\n{success} {name} ({country})"
         
-        # Check if all added successfully
-        if len(added) == len(guests):
+        # Check if every guest ended up on the reservation
+        if all(guest_ids):
             status_text = "✅ **Check-in uspješan!**"
-        elif added:
+        elif any(guest_ids):
             status_text = "⚠️ **Djelomično uspješno**"
         else:
             status_text = "❌ **Check-in nije uspio**"
