@@ -9,7 +9,33 @@ on:
       - main
 
 jobs:
+  lint:
+    # A NameError only surfaces when the code path runs, which for this bot
+    # means in front of a guest. Catch undefined names before the image ships.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check for undefined names
+        run: |
+          pip install --quiet pyflakes
+          # Report everything for visibility, but only fail the build on
+          # undefined names - the rest is pre-existing lint noise.
+          pyflakes src/ scripts/ || true
+          if pyflakes src/ scripts/ | grep -i 'undefined name'; then
+            echo "::error::undefined name(s) found - this would crash at runtime"
+            exit 1
+          fi
+          echo "No undefined names."
+
   build:
+    needs: lint
     runs-on: ubuntu-latest
     permissions:
       contents: read
