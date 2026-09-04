@@ -42,6 +42,28 @@ def is_checked_in(reservation: dict) -> bool:
 
 
 
+def _extract_total_pages(response: dict) -> Optional[int]:
+    """Pull a total page count out of whatever pagination shape came back."""
+    for container_key in ("meta", "pagination", "_meta", "links"):
+        container = response.get(container_key)
+        if isinstance(container, dict):
+            for key in ("totalPages", "total_pages", "lastPage", "last_page", "pageCount"):
+                value = container.get(key)
+                if isinstance(value, int) and value > 0:
+                    return value
+            nested = container.get("pagination")
+            if isinstance(nested, dict):
+                for key in ("totalPages", "total_pages", "lastPage", "last_page"):
+                    value = nested.get(key)
+                    if isinstance(value, int) and value > 0:
+                        return value
+    for key in ("totalPages", "total_pages", "lastPage", "last_page"):
+        value = response.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
 @dataclass
 class RentlioReservation:
     """Reservation data structure"""
@@ -157,6 +179,34 @@ class RentlioAPI:
     async def get_property(self, property_id: str) -> dict:
         """Get a single property"""
         return await self._request("GET", f"/properties/{property_id}")
+
+    async def get_units(self, property_id: str = None) -> list[dict]:
+        """
+        Get rental units (apartments).
+
+        Rentlio deployments differ in which of these two endpoints they
+        expose, so try the property-scoped one first and fall back to the
+        flat list. Returns [] instead of raising when neither exists - the
+        caller can still derive unit names from reservations.
+        """
+        endpoints = []
+        if property_id:
+            endpoints.append(f"/properties/{property_id}/units")
+        endpoints.append("/units")
+
+        for endpoint in endpoints:
+            try:
+                response = await self._request("GET", endpoint)
+            except RentlioAPIError as e:
+                if e.status_code in (400, 403, 404, 405):
+                    continue
+                raise
+            if isinstance(response, list):
+                return response
+            data = response.get("data", [])
+            if data:
+                return data
+        return []
     
     # ========== Reservations ==========
     
@@ -195,6 +245,64 @@ class RentlioAPI:
         
         response = await self._request("GET", "/reservations", params=params)
         return response.get("data", [])
+
+    async def get_all_reservations(
+        self,
+        date_from: str = None,
+        date_to: str = None,
+        property_id: str = None,
+        page_size: int = 100,
+        max_pages: int = 25,
+    ) -> list[dict]:
+        """
+        Get every reservation in a date range, following pagination.
+
+        /reservations returns one page at a time (perPage, default page 1).
+        A single page is enough for "who arrives tomorrow", but an analysis
+        that reads two seasons of history silently loses reservations if it
+        only ever looks at page 1.
+        """
+        params_base = {"perPage": page_size}
+        if property_id:
+            params_base["propertiesId"] = property_id
+        if date_from:
+            params_base["dateFrom"] = date_from
+        if date_to:
+            params_base["dateTo"] = date_to
+
+        collected: list[dict] = []
+        seen_ids: set = set()
+
+        for page in range(1, max_pages + 1):
+            params = dict(params_base, page=page)
+            response = await self._request("GET", "/reservations", params=params)
+            batch = response.get("data", [])
+            if not batch:
+                break
+
+            new_on_page = 0
+            for reservation in batch:
+                key = reservation.get("id")
+                if key is not None and key in seen_ids:
+                    continue
+                if key is not None:
+                    seen_ids.add(key)
+                collected.append(reservation)
+                new_on_page += 1
+
+            # An API that ignores `page` keeps handing back the same rows -
+            # stop instead of looping max_pages times over one page.
+            if new_on_page == 0:
+                break
+
+            if len(batch) < page_size:
+                break
+
+            total_pages = _extract_total_pages(response)
+            if total_pages is not None and page >= total_pages:
+                break
+
+        return collected
     
     async def get_reservation_details(self, reservation_id: str) -> dict:
         """Get detailed reservation info including guests"""

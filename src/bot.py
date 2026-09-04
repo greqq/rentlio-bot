@@ -40,6 +40,7 @@ from src.services.rentlio_api import (
     is_checked_in,
     is_live_reservation,
 )
+from src.services import ai_advisor, occupancy_service
 from src.services.ocr_service import ocr_service, ExtractedGuestData, strip_diacritics
 from src.services.country_mapper import country_mapper
 
@@ -117,7 +118,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [KeyboardButton("📅 Upcoming"), KeyboardButton("🌅 Today")],
         [KeyboardButton("🌄 Tomorrow"), KeyboardButton("🔍 Search")],
-        [KeyboardButton("❓ Help")]
+        [KeyboardButton("🤖 Analiza"), KeyboardButton("❓ Help")]
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -721,9 +722,128 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🌅 Today - Današnji dolasci\n"
         "🌄 Tomorrow - Sutrašnji dolasci\n"
         "🔍 Search - Pretraži gosta\n\n"
+        "**Statistika i cijene:**\n"
+        "/week - Tjedna statistika\n"
+        "/analiza [30|60] - AI analiza popunjenosti:\n"
+        "  gdje spustiti cijenu, gdje mijenjati min. broj noćenja,\n"
+        "  usporedba s istim terminima prijašnjih sezona\n\n"
         "**Računi:**\n"
         "/invoice <id> - Upravljaj računima\n",
         parse_mode="Markdown"
+    )
+
+
+# ========== Occupancy & Pricing Analysis ==========
+
+ANALYSIS_HORIZONS = (30, 60)
+
+
+def _analysis_keyboard(horizon_days: int, calendar_shown: bool) -> InlineKeyboardMarkup:
+    """Buttons to re-run the analysis over another horizon or with the calendar."""
+    horizon_row = [
+        InlineKeyboardButton(
+            f"{'✅ ' if days == horizon_days else ''}{days} dana",
+            callback_data=f"occ:{days}:report"
+        )
+        for days in ANALYSIS_HORIZONS
+    ]
+    second_row = []
+    if not calendar_shown:
+        second_row.append(
+            InlineKeyboardButton("🗓️ Kalendar", callback_data=f"occ:{horizon_days}:cal")
+        )
+    second_row.append(
+        InlineKeyboardButton("🔄 Osvježi", callback_data=f"occ:{horizon_days}:refresh")
+    )
+    return InlineKeyboardMarkup([horizon_row, second_row])
+
+
+async def _deliver_analysis(
+    message,
+    horizon_days: int,
+    include_calendar: bool = False,
+    use_cache: bool = True,
+):
+    """Run the analysis and push it to Telegram, rule-based part first."""
+    status = await message.reply_text(
+        f"📊 Analiziram iducih {horizon_days} dana i usporedujem s prijasnjim sezonama..."
+    )
+
+    try:
+        report = await occupancy_service.run_analysis(
+            api,
+            horizon_days=horizon_days,
+            history_years=2,
+            use_cache=use_cache,
+        )
+    except RentlioAPIError as e:
+        await status.edit_text(f"❌ Rentlio API greška: {e.message}")
+        return
+    except Exception as e:
+        logger.exception("Occupancy analysis failed")
+        await status.edit_text(f"❌ Greška u analizi: {e}")
+        return
+
+    chunks = occupancy_service.format_full_report(report, include_calendar=include_calendar)
+    await status.edit_text(chunks[0])
+    for chunk in chunks[1:-1]:
+        await message.reply_text(chunk)
+
+    keyboard = _analysis_keyboard(horizon_days, include_calendar)
+    if len(chunks) > 1:
+        await message.reply_text(chunks[-1], reply_markup=keyboard)
+    else:
+        await status.edit_reply_markup(reply_markup=keyboard)
+
+    # The AI brief is a bonus on top of a report that already stands on its own.
+    if not ai_advisor.is_available():
+        reason = ai_advisor.unavailable_reason()
+        if reason:
+            await message.reply_text(f"ℹ️ {reason}")
+        return
+
+    thinking = await message.reply_text("🤖 Pišem AI brief...")
+    advice = await ai_advisor.generate_advice(report)
+    if advice:
+        for i, chunk in enumerate(occupancy_service.split_message("🤖 AI BRIEF\n\n" + advice)):
+            if i == 0:
+                await thinking.edit_text(chunk)
+            else:
+                await message.reply_text(chunk)
+    else:
+        await thinking.edit_text(
+            "⚠️ AI brief nije uspio (vidi logove). Preporuke iznad su izracunate "
+            "iz podataka i vrijede i bez njega."
+        )
+
+
+async def analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/analiza [30|60] - occupancy and pricing analysis for the coming weeks"""
+    horizon_days = 30
+    if context.args:
+        try:
+            requested = int(context.args[0])
+            # Anything between a fortnight and a quarter is a sensible window;
+            # beyond that the historical comparison gets thin.
+            horizon_days = max(7, min(requested, 120))
+        except ValueError:
+            await update.message.reply_text(
+                "❓ Korištenje: /analiza [broj dana]\n\nPrimjer: /analiza 60"
+            )
+            return
+
+    await _deliver_analysis(update.message, horizon_days)
+
+
+async def handle_analysis_callback(query, context):
+    """Buttons under the analysis message."""
+    _, horizon_raw, mode = query.data.split(":")
+    horizon_days = int(horizon_raw)
+    await _deliver_analysis(
+        query.message,
+        horizon_days,
+        include_calendar=(mode == "cal"),
+        use_cache=(mode != "refresh"),
     )
 
 
@@ -1498,6 +1618,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # ========== NEW API Check-in Callbacks ==========
     
+    if query.data.startswith("occ:"):
+        await handle_analysis_callback(query, context)
+        return
+
     if query.data == "checkin_cancel":
         context.user_data.clear()
         await query.edit_message_text("❌ Check-in otkazan.")
@@ -1796,6 +1920,8 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         await tomorrow_arrivals(update, context)
     elif "Search" in text:
         await update.message.reply_text("🔍 Za pretragu koristi:\n/search <ime gosta>\n\nPrimjer: /search Marko")
+    elif "Analiza" in text:
+        await analysis_command(update, context)
     elif "Help" in text:
         await help_command(update, context)
 
@@ -1812,6 +1938,7 @@ async def setup_bot_commands(app: Application):
         BotCommand("cleaning", "🧹 Raspored čišćenja (7 dana)"),
         BotCommand("upcoming", "Dolasci sljedećih 7 dana"),
         BotCommand("week", "📊 Tjedna statistika"),
+        BotCommand("analiza", "🤖 AI analiza popunjenosti i cijena"),
         BotCommand("search", "Pretraži po imenu gosta"),
         BotCommand("invoice", "Upravljanje računima"),
         BotCommand("help", "Pomoć"),
@@ -2141,6 +2268,8 @@ def main():
     app.add_handler(CommandHandler("cleaning", cleaning_schedule))
     app.add_handler(CommandHandler("current", current_guests))
     app.add_handler(CommandHandler("week", week_stats))
+    app.add_handler(CommandHandler("analiza", analysis_command))
+    app.add_handler(CommandHandler("analysis", analysis_command))
     app.add_handler(CommandHandler("search", search_guest))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("notifications", toggle_notifications))
