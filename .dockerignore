@@ -33,8 +33,10 @@ architecture.md
 online-checkin-form-analysis.md
 rentlio-api-analysis.md
 
-# Scripts (development only)
-scripts/
+# scripts/ is NOT ignored: the Dockerfile copies it, because this deployment
+# pulls an image instead of checking out the repo, so diagnostics and one-off
+# analyses have to be runnable with `docker compose exec`. Excluding it here
+# makes the COPY fail the build outright ("/scripts": not found).
 
 # Docker
 Dockerfile

@@ -22,6 +22,19 @@ class Config:
         if uid.strip()
     ]
     
+    # Property / units. Both optional: the property ID narrows API queries when
+    # the account holds more than one property, and the unit count keeps the
+    # occupancy denominator right if an apartment has no bookings at all in the
+    # analysed window.
+    RENTLIO_PROPERTY_ID: str = os.getenv("RENTLIO_PROPERTY_ID", "")
+    RENTLIO_TOTAL_UNITS: int = int(os.getenv("RENTLIO_TOTAL_UNITS", "0") or 0)
+
+    # Anthropic (optional) - writes the occupancy analysis up in plain Croatian.
+    # Without a key the bot still produces the full rule-based report.
+    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+    ANTHROPIC_MODEL: str = os.getenv("ANTHROPIC_MODEL", "claude-opus-5")
+    AI_ADVISOR_EFFORT: str = os.getenv("AI_ADVISOR_EFFORT", "medium")
+
     # Google Cloud
     GOOGLE_APPLICATION_CREDENTIALS: str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
     

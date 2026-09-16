@@ -1,4 +1,5 @@
 aiohttp>=3.9.0
+anthropic>=1.0.0  # optional: AI commentary for /analiza
 google-cloud-vision>=3.5.0
 pydantic>=2.5.0
 python-dotenv>=1.0.0
