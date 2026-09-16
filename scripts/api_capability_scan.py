@@ -68,6 +68,20 @@ STATIC_ENDPOINTS = [
     "/reservations",
     "/guests",
     "/invoices",
+    # rates, availability and restrictions - the inputs a pricing analysis
+    # wants but the bot cannot currently read. Rentlio documents an endpoint
+    # that updates rates/availability/restrictions per unit type; these probes
+    # find out what this account actually exposes and under which name.
+    "/rates",
+    "/rate-plans",
+    "/rateplans",
+    "/unit-types",
+    "/unittypes",
+    "/availability",
+    "/restrictions",
+    "/calendar",
+    "/rates-availability",
+    "/prices",
     # enums (IDs needed for guest registration / eVisitor)
     "/enums/countries",
     "/enums/genders",
@@ -120,8 +134,27 @@ PROPERTY_ENDPOINTS = [
     "/properties/{prop}/units",
     "/properties/{prop}/guests/checked-in",
     "/properties/{prop}/rate-plans",
+    "/properties/{prop}/rateplans",
+    "/properties/{prop}/rates",
+    "/properties/{prop}/unit-types",
+    "/properties/{prop}/availability",
+    "/properties/{prop}/restrictions",
+    "/properties/{prop}/calendar",
     "/properties/{prop}/settings",
     "/properties/{prop}/webhooks",
+]
+
+# Endpoints probed with {unit} = a real unit (or unit type) id. A date range is
+# added by the scanner, since availability endpoints usually require one.
+UNIT_ENDPOINTS = [
+    "/units/{unit}",
+    "/units/{unit}/rates",
+    "/units/{unit}/availability",
+    "/units/{unit}/restrictions",
+    "/unit-types/{unit}",
+    "/unit-types/{unit}/rates",
+    "/unit-types/{unit}/availability",
+    "/unit-types/{unit}/rate-plans",
 ]
 
 INTERESTING_SUBSTRINGS = (
@@ -182,6 +215,10 @@ class Scanner:
                     sample = payload[0] if isinstance(payload, list) and payload else payload
                     entry["count"] = len(payload) if isinstance(payload, list) else None
                     entry["shape"] = shape(sample)
+                    # Remembered so later probes can reuse a real id (e.g. a
+                    # unit id for the rate / availability endpoints below).
+                    if isinstance(sample, dict) and sample.get("id") is not None:
+                        entry["sample_id"] = sample["id"]
                     entry["keys"] = sorted(collect_keys(sample))
                     if self.raw:
                         entry["sample"] = sample
@@ -212,6 +249,7 @@ async def main():
     parser = argparse.ArgumentParser(description="Scan the Rentlio API for capabilities")
     parser.add_argument("--reservation-id", help="Reservation id to probe (auto-detected if omitted)")
     parser.add_argument("--property-id", help="Property id to probe (auto-detected if omitted)")
+    parser.add_argument("--unit-id", help="Unit / unit type id to probe (auto-detected if omitted)")
     parser.add_argument("--raw", action="store_true", help="Include real values (contains guest PII)")
     parser.add_argument("--out", default=None, help="Where to write the JSON report")
     args = parser.parse_args()
@@ -268,6 +306,28 @@ async def main():
             print("\nPROPERTY ENDPOINTS")
             for ep in PROPERTY_ENDPOINTS:
                 print_line(await sc.probe(ep.format(prop=property_id)))
+                await asyncio.sleep(0.15)
+
+        # Unit / unit-type ids come from whichever listing answered above.
+        unit_id = args.unit_id
+        if not unit_id:
+            for ep in (f"/properties/{property_id}/units" if property_id else None, "/units", "/unit-types"):
+                if not ep:
+                    continue
+                entry = sc.results.get(ep, {})
+                if entry.get("status") == 200 and entry.get("sample_id"):
+                    unit_id = str(entry["sample_id"])
+                    break
+
+        if unit_id:
+            print(f"\nUNIT ENDPOINTS (unitId={unit_id})")
+            today = datetime.now().strftime("%Y-%m-%d")
+            future = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+            for ep in UNIT_ENDPOINTS:
+                print_line(await sc.probe(
+                    ep.format(unit=unit_id),
+                    {"dateFrom": today, "dateTo": future},
+                ))
                 await asyncio.sleep(0.15)
 
         if reservation_id:
