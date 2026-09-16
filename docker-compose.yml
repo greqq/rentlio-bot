@@ -9,10 +9,27 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    ports:
+      # Bound to loopback on purpose: the form is reached through the
+      # Cloudflare tunnel on the host, never straight off the internet.
+      # If cloudflared runs as a container on this compose network instead,
+      # drop this block and point it at http://rentlio-bot:8080.
+      - "127.0.0.1:8080:8080"
     volumes:
       # Mount Google Cloud credentials (read-only)
       - ./credentials:/app/credentials:ro
+      # Check-in tokens and pending submissions - must survive a redeploy
+      - ./data:/app/data
     environment:
       # Override to use mounted credentials path
       - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/google-cloud-vision.json
       - TZ=Europe/Zagreb
+      - DB_PATH=/app/data/bot.sqlite3
+      - WEB_PORT=8080
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=4).status == 200 else sys.exit(1)"]
+      interval: 60s
+      timeout: 10s
+      start_period: 30s
+      retries: 3

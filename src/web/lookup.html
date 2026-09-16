@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="hr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>Prijava — Sun Apartments</title>
+<style>
+  :root {
+    --bg: #f5f3ef; --card: #fff; --ink: #1c1b19; --muted: #6b6862;
+    --line: #e2ded6; --accent: #c2703d; --accent-ink: #fff; --err: #a33a2a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17171a; --card: #202024; --ink: #f0eee9; --muted: #a09c94;
+      --line: #32323a; --accent: #d2814c; --accent-ink: #17171a; --err: #e08776;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink); padding: 16px;
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 460px; margin: 0 auto; }
+  header { text-align: center; padding: 26px 0 20px; }
+  header h1 { font-size: 20px; margin: 0 0 4px; }
+  header p { margin: 0; color: var(--muted); font-size: 14px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; padding: 18px;
+  }
+  label { display: block; margin-bottom: 14px; }
+  label > span {
+    display: block; font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .04em; color: var(--muted); margin-bottom: 5px;
+  }
+  input {
+    font: inherit; width: 100%; padding: 11px 12px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button {
+    font: inherit; font-weight: 600; width: 100%; padding: 14px;
+    border: none; border-radius: 11px; background: var(--accent);
+    color: var(--accent-ink); cursor: pointer; margin-top: 4px;
+  }
+  button:active { opacity: .75; }
+  .msg {
+    font-size: 14px; padding: 12px; border-radius: 10px; margin-bottom: 14px;
+    color: var(--err); background: color-mix(in srgb, var(--err) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--err) 32%, transparent);
+  }
+  footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 20px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Sun Apartments</h1>
+    <p>Prijava gostiju</p>
+  </header>
+  <form class="card" method="POST" action="/checkin">
+    __ERROR__
+    <p style="margin:0 0 16px;color:var(--muted);font-size:14px">
+      Unesite prezime s rezervacije i datum dolaska da pronađemo vašu rezervaciju.
+    </p>
+    <label><span>Prezime</span>
+      <input type="text" name="surname" required autocomplete="family-name"
+             autocapitalize="words" value="__SURNAME__"></label>
+    <label><span>Datum dolaska</span>
+      <input type="date" name="arrival" required value="__ARRIVAL__"></label>
+    <button type="submit">Pronađi rezervaciju</button>
+  </form>
+  <footer>Ako ne ide, pošaljite nam poruku na WhatsApp.</footer>
+</div>
+</body>
+</html>

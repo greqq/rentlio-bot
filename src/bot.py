@@ -12,11 +12,10 @@ Features:
 - Daily notifications for check-ins and check-outs
 """
 import asyncio
-import calendar
 import logging
-import re
 import sys
 from pathlib import Path
+from urllib.parse import quote
 from datetime import datetime, timedelta, time
 from typing import Optional
 
@@ -40,7 +39,20 @@ from src.services.rentlio_api import (
     is_checked_in,
     is_live_reservation,
 )
-from src.services.ocr_service import ocr_service, ExtractedGuestData, strip_diacritics
+from src.services.ocr_service import ocr_service
+from src.services.checkin import (
+    REQUIRED_FOR_EVISITOR,
+    apply_guests_to_reservation,
+    guest_display_name,
+    guest_from_form,
+)
+from src.store import (
+    STATUS_APPLIED,
+    STATUS_FAILED,
+    STATUS_REJECTED,
+    Store,
+)
+from src.web.app import build_app, checkin_url, start_web
 from src.services.country_mapper import country_mapper
 
 # Setup logging
@@ -52,6 +64,9 @@ logger = logging.getLogger(__name__)
 
 # Initialize API
 api = RentlioAPI()
+
+# Tokens and pending submissions outlive a restart
+store = Store(config.DB_PATH)
 
 # Notification settings
 NOTIFICATION_TIME = time(hour=8, minute=0)  # 8:00 AM
@@ -712,10 +727,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show help"""
     await update.message.reply_text(
         "📖 **Pomoć**\n\n"
-        "**📷 Check-in:**\n"
+        "**📷 Check-in (ti slikaš):**\n"
         "1️⃣ Pošalji slike osobnih iskaznica\n"
         "2️⃣ Odaberi rezervaciju\n"
         "3️⃣ Gosti se dodaju direktno u Rentlio!\n\n"
+        "**🔗 Samostalna prijava (gost slika):**\n"
+        "/link - linkovi za dolaske u 7 dana, s gumbom\n"
+        "         za slanje na WhatsApp\n"
+        "/pending - prijave koje čekaju tvoje odobrenje\n"
+        "_Gost slika osobnu na linku, ti dobiješ karticu_\n"
+        "_s podacima i tek tvoj ✅ piše u Rentlio._\n\n"
         "**Rezervacije:**\n"
         "📅 Upcoming - Sljedećih 7 dana\n"
         "🌅 Today - Današnji dolasci\n"
@@ -910,136 +931,47 @@ async def show_reservation_selection(query, context):
         context.user_data.clear()
 
 
-def convert_date_to_timestamp(date_str: str) -> Optional[str]:
-    """Convert DD.MM.YYYY to Unix timestamp string (UTC midnight)"""
-    if not date_str:
-        return None
-    
-    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
-        try:
-            dt = datetime.strptime(date_str, fmt)
-            # Use calendar.timegm to treat as UTC midnight
-            # (datetime.timestamp() uses local tz, causing off-by-one day)
-            return str(int(calendar.timegm(dt.timetuple())))
-        except ValueError:
-            continue
-    
-    return None
+def format_checkin_outcome(outcome, reservation_id: str, reservation_data: dict,
+                           guests: list) -> str:
+    """Render what apply_guests_to_reservation did, for the chat."""
+    if outcome.fully_successful:
+        status_text = "✅ **Check-in uspješan!**"
+    elif outcome.partially_successful:
+        status_text = "⚠️ **Djelomično uspješno**"
+    else:
+        status_text = "❌ **Check-in nije uspio**"
 
+    guest_summary = ""
+    for i, guest in enumerate(guests):
+        name = guest_display_name(guest, i)
+        country = guest.nationality or "N/A"
+        mark = "✅" if i < len(outcome.guest_ids) and outcome.guest_ids[i] else "⚠️"
+        guest_summary += f"\n{mark} {name} ({country})"
 
-def convert_gender_to_id(gender: str) -> Optional[int]:
-    """Convert M/F to Rentlio gender ID (1=Female, 2=Male)"""
-    if not gender:
-        return None
-    
-    g = gender.upper().strip()
-    if g in ('M', 'MALE', 'MUŠKO', 'MUSKI'):
-        return 2
-    elif g in ('F', 'FEMALE', 'ŽENSKO', 'ZENSKO', 'ŽENSKI'):
-        return 1
-    return None
+    if outcome.checkin_marked:
+        checkin_status = "\n✅ Rezervacija označena kao checked-in"
+    elif outcome.checkin_error:
+        checkin_status = f"\n⚠️ Gosti dodani, ali checkin status: {outcome.checkin_error}"
+    else:
+        checkin_status = ""
 
+    msg_text = ""
+    if outcome.messages:
+        msg_text = "\n\n📝 API poruke:\n" + "\n".join(
+            f"• {m[:100]}" for m in outcome.messages[:3]
+        )
 
-# Direct mapping: (document_type, is_croatian) -> eVisitorDocumentTypeId.
-# IDs from /enums/guests/document-types; verified against a reservation
-# registered through Rentlio's own UI, which stores 25 for a Croatian ID card.
-_DOCUMENT_TYPE_IDS = {
-    ("ID_CARD", True): 25,       # Personal ID card (Croatian)
-    ("ID_CARD", False): 23,      # Personal ID card (foreign)
-    ("PASSPORT", True): 14,      # Personal passport (Croatian)
-    ("PASSPORT", False): 18,     # Personal passport (foreign)
-}
-
-
-def _get_document_type_id(doc_type: str, nationality: str = None) -> Optional[int]:
-    """Get Rentlio document type ID.
-    
-    Args:
-        doc_type: "ID_CARD" or "PASSPORT"
-        nationality: Guest nationality string
-    
-    Returns:
-        eVisitorDocumentTypeId or None
-    """
-    if not doc_type:
-        return None
-    is_croatian = nationality and nationality.lower() in ('hrvatska', 'croatia', 'hrv', 'cro')
-    type_id = _DOCUMENT_TYPE_IDS.get((doc_type, is_croatian))
-    if type_id is None:
-        # Fallback: try without nationality
-        type_id = _DOCUMENT_TYPE_IDS.get((doc_type, False))
-    logger.info(f"Document type mapping: {doc_type}, croatian={is_croatian} -> id={type_id}")
-    return type_id
-
-
-# Tourist tax categories from /enums/guests/tax-categories. eVisitor splits
-# guests by age; a reservation registered through Rentlio's UI stores 3 for an
-# adult.
-TAX_CATEGORY_ADULT = 3          # Tourist staying in a property
-TAX_CATEGORY_CHILD_12_TO_18 = 4  # Children: between 12 and 18 years
-TAX_CATEGORY_CHILD_UNDER_12 = 7  # Children up to 12 years
-
-
-def _get_tourist_tax_category(date_of_birth: str) -> int:
-    """Pick the eVisitor tourist tax category from the guest's date of birth.
-
-    Falls back to the adult category when the date is missing or unparseable -
-    charging tourist tax that may not be due is recoverable, omitting a guest
-    from eVisitor is not.
-    """
-    if not date_of_birth:
-        return TAX_CATEGORY_ADULT
-
-    born = None
-    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
-        try:
-            born = datetime.strptime(date_of_birth, fmt)
-            break
-        except ValueError:
-            continue
-    if born is None:
-        logger.warning(f"Unparseable date of birth {date_of_birth!r}, assuming adult")
-        return TAX_CATEGORY_ADULT
-
-    today = datetime.now()
-    age = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
-
-    if age < 12:
-        return TAX_CATEGORY_CHILD_UNDER_12
-    if age < 18:
-        return TAX_CATEGORY_CHILD_12_TO_18
-    return TAX_CATEGORY_ADULT
-
-
-def _name_key(name: str) -> str:
-    """Comparable form of a guest name.
-
-    OCR gives "DORA MASANOVIC", Rentlio may hold "Dora Mašanović", and a
-    booking channel may put the surname first. Compare on sorted, accent-free,
-    lowercase words so all three land on the same key.
-    """
-    if not name:
-        return ""
-    words = re.findall(r"[^\W\d_]+", strip_diacritics(name).lower(), re.UNICODE)
-    return " ".join(sorted(words))
-
-
-def _match_existing_guest(guest, existing: list) -> Optional[dict]:
-    """Find the guest already on the reservation, if this is the same person.
-
-    Booking channels put the holder on the reservation before anyone scans a
-    document, so the common case is that the person we just read from an ID is
-    already there with empty fields. Adding them again is what produced
-    duplicate registrations.
-    """
-    name = guest.full_name or f"{guest.first_name or ''} {guest.last_name or ''}"
-    key = _name_key(name)
-    if not key:
-        return None
-    for candidate in existing:
-        if _name_key(candidate.get("name", "")) == key:
-            return candidate
-    return None
+    return (
+        f"{status_text}\n\n"
+        f"📋 Rezervacija: #{reservation_id}\n"
+        f"👤 Booker: {reservation_data.get('guestName', 'N/A')}\n"
+        f"🏠 {reservation_data.get('unitName', 'N/A')}\n"
+        f"📅 {format_date(reservation_data.get('arrivalDate', 0))} → "
+        f"{format_date(reservation_data.get('departureDate', 0))}\n\n"
+        f"**Prijavljeni gosti:**{guest_summary}"
+        f"{checkin_status}"
+        f"{msg_text}"
+    )
 
 
 async def perform_api_checkin(query, context, reservation_id: str):
@@ -1047,271 +979,32 @@ async def perform_api_checkin(query, context, reservation_id: str):
     guests = context.user_data.get('checkin_guests', [])
     reservations = context.user_data.get('checkin_reservations', {})
     reservation_data = reservations.get(reservation_id, {})
-    
+
     if not guests:
         await query.edit_message_text("⚠️ Nema gostiju za prijavu.")
         context.user_data.clear()
         return
-    
+
     await query.edit_message_text(
         f"⏳ Prijavljujem {len(guests)} gost(a) na rezervaciju #{reservation_id}..."
     )
-    
+
     try:
-        # A channel booking already carries its holder, so scanning that
-        # person's ID and blindly POSTing them added the same human twice.
-        # Read what is there first and update in place where it is the same
-        # person.
-        existing_guests = []
-        try:
-            existing_guests = await api.get_reservation_guests_v2(reservation_id)
-        except Exception as e:
-            logger.warning(f"Could not read existing guests, treating all as new: {e}")
-        has_primary = any(g.get("isPrimary") == "Y" for g in existing_guests)
-        logger.info(
-            f"Reservation {reservation_id} already has {len(existing_guests)} guest(s), "
-            f"primary present: {has_primary}"
-        )
+        outcome = await apply_guests_to_reservation(api, reservation_id, guests)
 
-        # Only guests without a match are POSTed; document and eVisitor fields
-        # always go through a PUT, which needs the guest to have an id.
-        api_guests = []
-        guest_doc_data = []
-        guest_ids = []  # existing id per guest, or None until POST assigns one
-
-        for i, guest in enumerate(guests):
-            # Build full name
-            name = guest.full_name
-            if not name and (guest.first_name or guest.last_name):
-                name = f"{guest.first_name or ''} {guest.last_name or ''}".strip()
-            
-            if not name:
-                name = f"Gost {i + 1}"
-            
-            # Get country ID
-            country_id = None
-            if guest.nationality:
-                country_id = country_mapper.get_country_id(guest.nationality)
-            
-            matched = _match_existing_guest(guest, existing_guests)
-            if matched:
-                # Keep the role the reservation already assigned - overwriting
-                # a booker or primary flag would reshuffle the reservation.
-                roles = {
-                    "isBooker": matched.get("isBooker") or "N",
-                    "isPrimary": matched.get("isPrimary") or "N",
-                    "isAdditional": matched.get("isAdditional") or "N",
-                }
-                guest_ids.append(matched.get("id"))
-                logger.info(f"Guest {i+1} ({name}) matches existing guest {matched.get('id')}")
-            else:
-                # Only one guest can be primary; if the reservation already has
-                # one, everyone we add is an additional guest.
-                takes_primary = not has_primary
-                has_primary = has_primary or takes_primary
-                roles = {
-                    "isBooker": "N",
-                    "isPrimary": "Y" if takes_primary else "N",
-                    "isAdditional": "N" if takes_primary else "Y",
-                }
-                guest_ids.append(None)
-
-            api_guest = {"name": name, **roles}
-            
-            # Date of birth (UTC midnight to avoid timezone off-by-one)
-            if guest.date_of_birth:
-                ts = convert_date_to_timestamp(guest.date_of_birth)
-                if ts:
-                    api_guest["dateOfBirth"] = ts
-                    logger.info(f"Guest {name}: dateOfBirth={guest.date_of_birth} -> ts={ts}")
-            
-            # Gender
-            if guest.gender:
-                gender_id = convert_gender_to_id(guest.gender)
-                if gender_id:
-                    api_guest["genderId"] = gender_id
-            
-            # Country fields
-            if country_id:
-                api_guest["countryId"] = country_id
-                api_guest["citizenshipCountryId"] = country_id
-                api_guest["countryOfBirthId"] = country_id
-                api_guest["countryOfResidenceId"] = country_id
-            
-            # City of residence
-            if guest.place_of_residence:
-                api_guest["cityOfResidence"] = guest.place_of_residence
-            
-            # Street address
-            if hasattr(guest, 'address') and guest.address:
-                api_guest["address"] = guest.address
-            
-            # Build note with document info as backup
-            note_parts = []
-            if guest.document_number:
-                note_parts.append(f"Doc: {guest.document_number}")
-            if guest.expiry_date:
-                note_parts.append(f"Exp: {guest.expiry_date}")
-            if guest.oib:
-                note_parts.append(f"OIB: {guest.oib}")
-            if note_parts:
-                api_guest["note"] = " | ".join(note_parts)
-            
-            # Collect document data for PUT update
-            doc_fields = {}
-            if guest.document_number:
-                doc_fields["documentNumber"] = str(guest.document_number)
-            doc_type = getattr(guest, 'document_type', None)
-            if doc_type:
-                doc_type_id = _get_document_type_id(doc_type, guest.nationality)
-                if doc_type_id:
-                    doc_fields["eVisitorDocumentTypeId"] = doc_type_id
-            doc_fields["arrivalArrangementId"] = 2   # Personal (1 is Agency)
-            doc_fields["providedServicesTypeId"] = 1  # Accommodation
-            doc_fields["eVisitorTouristTaxCategoryId"] = _get_tourist_tax_category(
-                guest.date_of_birth
-            )
-            guest_doc_data.append(doc_fields)
-            
-            logger.info(f"Guest {i+1} POST data: {api_guest}")
-            logger.info(f"Guest {i+1} doc fields (for PUT): {doc_fields}")
-            api_guests.append(api_guest)
-        
-        messages = []
-        added = []
-
-        # Phase 1: POST - create only the guests not already on the reservation
-        new_indices = [i for i, gid in enumerate(guest_ids) if gid is None]
-        if new_indices:
-            result = await api.add_reservation_guests(
-                reservation_id, [api_guests[i] for i in new_indices]
-            )
-            added = result.get('guestAdded', [])
-            messages = list(result.get('messages', []))
-            logger.info(f"POST result: added={added}, messages={messages}")
-            for slot, new_id in zip(new_indices, added):
-                guest_ids[slot] = new_id
-            if len(added) != len(new_indices):
-                logger.warning(
-                    f"POSTed {len(new_indices)} guest(s) but got {len(added)} id(s) back"
-                )
-        else:
-            logger.info("Every guest already existed on the reservation - nothing to POST")
-
-        # Phase 2: PUT - document and eVisitor fields, for matched and new alike
-        update_guests = []
-        for i, guest_id in enumerate(guest_ids):
-            if guest_id is None or not guest_doc_data[i]:
-                continue
-            update_obj = {
-                "id": guest_id,
-                **api_guests[i],
-                **guest_doc_data[i],
-            }
-            update_guests.append(update_obj)
-            logger.info(f"Guest {i+1} PUT data: {update_obj}")
-
-        if update_guests:
-            try:
-                update_result = await api.update_reservation_guests(
-                    reservation_id, update_guests
-                )
-                updated_ids = update_result.get('guestUpdated', [])
-                update_msgs = update_result.get('messages', [])
-                logger.info(f"PUT result: updated={updated_ids}, messages={update_msgs}")
-                if update_msgs:
-                    messages.extend(update_msgs)
-            except Exception as e:
-                logger.error(f"PUT update failed: {e}")
-                messages.append("⚠️ Dokument polja: potreban ručni unos")
-        
-        # Verify against the same endpoint we wrote to, so a field that did not
-        # stick shows up here instead of surfacing weeks later in eVisitor.
-        REQUIRED_FOR_EVISITOR = (
-            "documentNumber",
-            "eVisitorDocumentTypeId",
-            "eVisitorTouristTaxCategoryId",
-            "dateOfBirth",
-        )
-        try:
-            saved = await api.get_reservation_guests_v2(reservation_id)
-            incomplete = []
-            for g in saved:
-                missing = [f for f in REQUIRED_FOR_EVISITOR if not g.get(f)]
-                logger.info(
-                    f"Verify guest {g.get('id')}: "
-                    + ", ".join(f"{f}={g.get(f)}" for f in REQUIRED_FOR_EVISITOR)
-                    + f", arrivalArrangementId={g.get('arrivalArrangementId')}"
-                    + f", providedServicesTypeId={g.get('providedServicesTypeId')}"
-                )
-                if missing:
-                    incomplete.append(f"{g.get('name', g.get('id'))}: {', '.join(missing)}")
-
-            if incomplete:
-                messages.append("⚠️ Nedostaje za eVisitor — " + " | ".join(incomplete))
-        except Exception as e:
-            logger.warning(f"Verify GET failed: {e}")
-            messages.append("⚠️ Nisam mogao provjeriti spremljene podatke")
-        
-        # Mark checked-in once every guest is on the reservation, whether we
-        # created them or updated one that was already there.
-        checkin_status = ""
-        if any(guest_ids):
-            try:
-                checkin_result = await api.checkin_reservation(reservation_id)
-                logger.info(f"Checkin result: {checkin_result}")
-                checkin_status = "\n✅ Rezervacija označena kao checked-in"
-            except RentlioAPIError as e:
-                logger.warning(f"Checkin status update failed: {e.message}")
-                checkin_status = f"\n⚠️ Gosti dodani, ali checkin status: {e.message}"
-        
-        # Build success message
-        guest_name = reservation_data.get('guestName', 'N/A')
-        unit_name = reservation_data.get('unitName', 'N/A')
-        arrival = format_date(reservation_data.get('arrivalDate', 0))
-        departure = format_date(reservation_data.get('departureDate', 0))
-        
-        # Guest summary
-        guest_summary = ""
-        for i, guest in enumerate(guests):
-            name = guest.full_name or f"{guest.first_name} {guest.last_name}".strip()
-            country = guest.nationality or "N/A"
-            success = "✅" if guest_ids[i] else "⚠️"
-            guest_summary += f"\n{success} {name} ({country})"
-        
-        # Check if every guest ended up on the reservation
-        if all(guest_ids):
-            status_text = "✅ **Check-in uspješan!**"
-        elif any(guest_ids):
-            status_text = "⚠️ **Djelomično uspješno**"
-        else:
-            status_text = "❌ **Check-in nije uspio**"
-        
-        # Show any messages from API
-        msg_text = ""
-        if messages:
-            msg_text = "\n\n📝 API poruke:\n" + "\n".join(f"• {m[:100]}" for m in messages[:3])
-        
         await query.edit_message_text(
-            f"{status_text}\n\n"
-            f"📋 Rezervacija: #{reservation_id}\n"
-            f"👤 Booker: {guest_name}\n"
-            f"🏠 {unit_name}\n"
-            f"📅 {arrival} → {departure}\n\n"
-            f"**Prijavljeni gosti:**{guest_summary}"
-            f"{checkin_status}"
-            f"{msg_text}",
+            format_checkin_outcome(outcome, reservation_id, reservation_data, guests),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🧾 Generiraj račun", callback_data=f"checkin_invoice_{reservation_id}")],
                 [InlineKeyboardButton("✅ Gotovo", callback_data="checkin_done")]
             ])
         )
-        
+
         # Store for potential invoice generation
         context.user_data['checkin_completed_reservation'] = reservation_id
         context.user_data['checkin_completed_reservation_data'] = reservation_data
-        
+
     except RentlioAPIError as e:
         logger.error(f"API Check-in error: {e.message}, data: {e.response_data}")
         await query.edit_message_text(
@@ -1324,6 +1017,318 @@ async def perform_api_checkin(query, context, reservation_id: str):
         logger.error(f"Check-in error: {e}")
         await query.edit_message_text(f"❌ Greška: {str(e)}")
         context.user_data.clear()
+
+
+# ========== Self Check-in (form submissions & link delivery) ==========
+
+def _wa_number(raw: str) -> Optional[str]:
+    """Digits for a wa.me link, or None when the number is not dialable.
+
+    Only a number that carries its own country code is trusted. "091 234 5678"
+    could be Croatian or could be anything - guessing a prefix risks sending a
+    guest's check-in link to a stranger, so those fall back to copy-paste.
+    """
+    if not raw:
+        return None
+    text = str(raw).strip()
+    digits = "".join(c for c in text if c.isdigit())
+    if not digits:
+        return None
+    if text.startswith("+"):
+        return digits if 8 <= len(digits) <= 15 else None
+    if digits.startswith("00"):
+        trimmed = digits[2:]
+        return trimmed if 8 <= len(trimmed) <= 15 else None
+    return None
+
+
+def _wa_message(first_name: str, unit_name: str, link: str) -> str:
+    """The message the owner sends; WhatsApp opens with this pre-filled."""
+    greeting = f"Dobar dan{' ' + first_name if first_name else ''}!"
+    return (
+        f"{greeting} Radujemo se vašem dolasku u {unit_name or 'naš apartman'}.\n\n"
+        f"Da vam ubrzamo prijavu, podatke možete poslati unaprijed ovdje:\n{link}\n\n"
+        f"Dovoljno je slikati osobnu ili putovnicu. Vidimo se!"
+    )
+
+
+async def _checkin_link(reservation_id: str) -> Optional[str]:
+    """Issue (or reuse) a token and build the public link for it."""
+    if not config.PUBLIC_BASE_URL:
+        return None
+    token = await store.create_token(reservation_id, config.CHECKIN_TOKEN_TTL_DAYS)
+    return checkin_url(token)
+
+
+async def build_link_buttons(res: dict) -> list:
+    """Rows for 'send the guest their check-in link'.
+
+    A wa.me deep link opens WhatsApp with the message already written, which
+    is the same trick Rentlio's own "send message" uses - one tap instead of
+    finding the reservation in their app.
+    """
+    reservation_id = str(res.get("id", ""))
+    link = await _checkin_link(reservation_id)
+    if not link:
+        return []
+
+    rows = []
+    number = _wa_number(res.get("guestContactNumber", ""))
+    if number:
+        guest_name = res.get("guestName", "") or ""
+        first_name = guest_name.split()[0] if guest_name.split() else ""
+        text = _wa_message(first_name, res.get("unitName", ""), link)
+        rows.append([InlineKeyboardButton(
+            "📲 Pošalji link na WhatsApp",
+            url=f"https://wa.me/{number}?text={quote(text)}",
+        )])
+    rows.append([InlineKeyboardButton("🔗 Otvori link", url=link)])
+    return rows
+
+
+async def registration_pending(reservation_id: str) -> Optional[bool]:
+    """Is anything still missing before this reservation can go to eVisitor?
+
+    None means we could not tell - never claim a guest is registered on the
+    strength of a failed request.
+    """
+    try:
+        guests = await api.get_reservation_guests_v2(reservation_id)
+    except Exception as e:
+        logger.warning(f"Could not check registration for {reservation_id}: {e}")
+        return None
+    if not guests:
+        return True
+    return any(
+        not guest.get(field)
+        for guest in guests
+        for field in REQUIRED_FOR_EVISITOR
+    )
+
+
+def format_submission(submission: dict) -> str:
+    """The approval card: what the guest sent, before anything is written."""
+    lines = [
+        "📥 **Nova samostalna prijava**\n",
+        f"📋 Rezervacija: #{submission['reservation_id']}",
+        f"👥 Osoba: {len(submission['guests'])}\n",
+    ]
+    for i, guest in enumerate(submission["guests"], start=1):
+        lines.append(f"**{i}. {guest.get('fullName', '—')}**")
+        if guest.get("dateOfBirth"):
+            lines.append(f"   🎂 {guest['dateOfBirth']}")
+        if guest.get("documentNumber"):
+            doc_label = {
+                "ID_CARD": "osobna", "PASSPORT": "putovnica",
+            }.get(guest.get("documentType", ""), "dokument")
+            lines.append(f"   🪪 {guest['documentNumber']} ({doc_label})")
+        if guest.get("nationality"):
+            lines.append(f"   🌍 {guest['nationality']}")
+        if guest.get("gender"):
+            lines.append(f"   ⚧ {'Žensko' if guest['gender'] == 'F' else 'Muško'}")
+        if guest.get("placeOfResidence"):
+            lines.append(f"   🏠 {guest['placeOfResidence']}")
+        lines.append("")
+
+    lines.append("_Provjeri kvačice u imenima — čitač ih ne vidi._")
+    return "\n".join(lines)
+
+
+async def notify_submission(bot, submission_id: int) -> None:
+    """Tell the owner a guest submitted data, and wait for their decision."""
+    submission = await store.get_submission(submission_id)
+    if not submission:
+        logger.error(f"Submission {submission_id} vanished before notifying")
+        return
+
+    markup = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Prihvati", callback_data=f"sub_ok_{submission_id}"),
+            InlineKeyboardButton("❌ Odbij", callback_data=f"sub_no_{submission_id}"),
+        ],
+    ])
+    text = format_submission(submission)
+
+    for user_id in config.TELEGRAM_ALLOWED_USERS:
+        try:
+            await bot.send_message(
+                chat_id=user_id, text=text,
+                parse_mode="Markdown", reply_markup=markup,
+            )
+        except Exception as e:
+            logger.error(f"Could not send submission {submission_id} to {user_id}: {e}")
+
+
+async def apply_submission(query, context, submission_id: int) -> None:
+    """Owner approved: write the guest's data to Rentlio."""
+    submission = await store.get_submission(submission_id)
+    if not submission:
+        await query.edit_message_text("⚠️ Prijava više ne postoji.")
+        return
+
+    # claim_submission only succeeds once, so a double tap cannot register the
+    # same guests twice.
+    claimed = await store.claim_submission(
+        submission_id, STATUS_APPLIED, decided_by=query.from_user.id
+    )
+    if not claimed:
+        await query.edit_message_text(
+            f"ℹ️ Ova prijava je već obrađena (status: {submission['status']})."
+        )
+        return
+
+    reservation_id = submission["reservation_id"]
+    await query.edit_message_text(
+        f"⏳ Prijavljujem {len(submission['guests'])} gost(a) "
+        f"na rezervaciju #{reservation_id}..."
+    )
+
+    guests = [guest_from_form(g) for g in submission["guests"]]
+
+    try:
+        await country_mapper.load_countries(api)
+        outcome = await apply_guests_to_reservation(api, reservation_id, guests)
+    except RentlioAPIError as e:
+        logger.error(f"Submission {submission_id} failed: {e.message}")
+        await store.set_status(submission_id, STATUS_FAILED, note=e.message)
+        await query.edit_message_text(
+            f"❌ **API Greška**\n\n{e.message}\n\n"
+            f"Podaci su sačuvani — pokušaj ponovo iz Rentlio UI-ja."
+        )
+        return
+    except Exception as e:
+        logger.error(f"Submission {submission_id} failed: {e}")
+        await store.set_status(submission_id, STATUS_FAILED, note=str(e))
+        await query.edit_message_text(f"❌ Greška: {e}")
+        return
+
+    if not outcome.fully_successful:
+        await store.set_status(
+            submission_id, STATUS_FAILED if not outcome.partially_successful
+            else STATUS_APPLIED,
+            note=" | ".join(outcome.messages[:3]) or None,
+        )
+
+    reservation_data = {}
+    try:
+        details = await api.get_reservation_details(reservation_id)
+        reservation_data = {
+            "guestName": (details.get("holder") or {}).get("name", "N/A"),
+            "unitName": details.get("unitName", "N/A"),
+            "arrivalDate": details.get("arrivalDate", 0),
+            "departureDate": details.get("departureDate", 0),
+        }
+    except Exception as e:
+        logger.warning(f"Could not load reservation {reservation_id} for summary: {e}")
+
+    await query.edit_message_text(
+        format_checkin_outcome(outcome, reservation_id, reservation_data, guests),
+        parse_mode="Markdown",
+    )
+
+
+async def reject_submission(query, submission_id: int) -> None:
+    """Owner declined: nothing is written, the data stays on record."""
+    claimed = await store.claim_submission(
+        submission_id, STATUS_REJECTED, decided_by=query.from_user.id
+    )
+    if not claimed:
+        await query.edit_message_text("ℹ️ Ova prijava je već obrađena.")
+        return
+    await query.edit_message_text(
+        "❌ Prijava odbijena. Ništa nije zapisano u Rentlio.\n\n"
+        "_Gost može ponovo otvoriti isti link i poslati ispravljene podatke._",
+        parse_mode="Markdown",
+    )
+
+
+async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/pending - re-send the approval cards still waiting for a decision.
+
+    Submissions live in SQLite, so a restart no longer loses them - but the
+    Telegram message that carried the buttons is gone. This brings it back.
+    """
+    submissions = await store.pending_submissions()
+    if not submissions:
+        await update.message.reply_text("✅ Nema prijava koje čekaju odobrenje.")
+        return
+
+    await update.message.reply_text(
+        f"📥 {len(submissions)} prijava čeka odobrenje:"
+    )
+    for submission in submissions:
+        await update.message.reply_text(
+            format_submission(submission),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "✅ Prihvati", callback_data=f"sub_ok_{submission['id']}"),
+                InlineKeyboardButton(
+                    "❌ Odbij", callback_data=f"sub_no_{submission['id']}"),
+            ]]),
+        )
+
+
+async def link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/link - check-in links for everyone arriving in the next week."""
+    if not config.PUBLIC_BASE_URL:
+        await update.message.reply_text(
+            "⚠️ PUBLIC_BASE_URL nije postavljen, pa ne mogu složiti link.\n"
+            "Dodaj ga u .env (npr. https://sun-apartments.co) i restartaj bota."
+        )
+        return
+
+    await update.message.reply_text("⏳ Tražim dolaske...")
+
+    try:
+        reservations = await api.get_reservations(
+            date_from=datetime.now().strftime("%Y-%m-%d"),
+            date_to=(datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d"),
+            limit=100,
+        )
+    except RentlioAPIError as e:
+        await update.message.reply_text(f"❌ API Greška: {e.message}")
+        return
+
+    today_ts = int(datetime.now().replace(hour=0, minute=0, second=0).timestamp())
+    upcoming = sorted(
+        (
+            res for res in reservations
+            if is_live_reservation(res) and res.get("arrivalDate", 0) >= today_ts
+        ),
+        key=lambda r: r.get("arrivalDate", 0),
+    )
+
+    if not upcoming:
+        await update.message.reply_text("📭 Nema dolazaka u sljedećih 7 dana.")
+        return
+
+    for res in upcoming:
+        pending = await registration_pending(str(res.get("id")))
+        state = {
+            True: "⚠️ Podaci još nisu popunjeni",
+            False: "✅ Podaci su popunjeni",
+            None: "❔ Ne mogu provjeriti podatke",
+        }[pending]
+
+        phone = res.get("guestContactNumber", "")
+        text = (
+            f"🏠 **{res.get('unitName', 'N/A')}** · "
+            f"{format_date(res.get('arrivalDate', 0))} → "
+            f"{format_date(res.get('departureDate', 0))}\n"
+            f"👤 {res.get('guestName', 'N/A')}\n"
+            f"{state}"
+        )
+        if phone:
+            text += f"\n📞 {phone}"
+        if phone and not _wa_number(phone):
+            text += "\n_(broj bez pozivnog — pošalji ručno)_"
+
+        rows = await build_link_buttons(res)
+        await update.message.reply_text(
+            text, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+        )
 
 
 # ========== Photo / Check-in Flow ==========
@@ -1496,6 +1501,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
+    # ========== Self check-in submissions ==========
+
+    if query.data.startswith("sub_ok_"):
+        await apply_submission(query, context, int(query.data.replace("sub_ok_", "")))
+        return
+
+    elif query.data.startswith("sub_no_"):
+        await reject_submission(query, int(query.data.replace("sub_no_", "")))
+        return
+
     # ========== NEW API Check-in Callbacks ==========
     
     if query.data == "checkin_cancel":
@@ -1805,6 +1820,8 @@ async def setup_bot_commands(app: Application):
     commands = [
         BotCommand("start", "Pokreni bota"),
         BotCommand("checkin", "🆕 API Check-in (bez forme!)"),
+        BotCommand("link", "📲 Pošalji gostu link za prijavu"),
+        BotCommand("pending", "📥 Prijave koje čekaju odobrenje"),
         BotCommand("current", "🏠 Trenutni gosti"),
         BotCommand("today", "Današnji dolasci"),
         BotCommand("tomorrow", "Sutrašnji dolasci"),
@@ -1960,6 +1977,26 @@ async def send_daily_notification(context: ContextTypes.DEFAULT_TYPE):
                     if email:
                         text += f"    ✉️ {email}\n"
         
+        # Tomorrow's arrivals that still need their data, one card each so the
+        # "send the link" button sits next to the guest it belongs to.
+        action_cards = []
+        for res in tomorrow_arrivals:
+            pending = await registration_pending(str(res.get("id")))
+            if pending is False:
+                continue  # already registered - nothing to chase
+            rows = await build_link_buttons(res)
+            if not rows:
+                continue
+            phone = res.get("guestContactNumber", "")
+            card = (
+                f"📲 **{res.get('guestName', 'N/A')}** — {res.get('unitName', 'N/A')}\n"
+                + ("⚠️ Podaci još nisu popunjeni" if pending
+                   else "❔ Ne mogu provjeriti podatke")
+            )
+            if phone and not _wa_number(phone):
+                card += f"\n📞 {phone}\n_(broj bez pozivnog — pošalji ručno)_"
+            action_cards.append((card, InlineKeyboardMarkup(rows)))
+
         # Send to all allowed users
         for user_id in config.TELEGRAM_ALLOWED_USERS:
             try:
@@ -1971,6 +2008,16 @@ async def send_daily_notification(context: ContextTypes.DEFAULT_TYPE):
                 logger.info(f"Sent daily notification to user {user_id}")
             except Exception as e:
                 logger.error(f"Failed to send notification to {user_id}: {e}")
+                continue
+
+            for card, markup in action_cards:
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id, text=card,
+                        parse_mode="Markdown", reply_markup=markup,
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send link card to {user_id}: {e}")
         
     except Exception as e:
         logger.error(f"Error sending daily notification: {e}")
@@ -2128,6 +2175,8 @@ def main():
     
     print("🤖 Starting Rentlio Bot...")
     print(f"API URL: {config.RENTLIO_API_URL}")
+    for warning in config.warnings():
+        print(f"⚠️  {warning}")
     
     # Create application
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
@@ -2146,6 +2195,8 @@ def main():
     app.add_handler(CommandHandler("notifications", toggle_notifications))
     app.add_handler(CommandHandler("invoice", invoice_command))
     app.add_handler(CommandHandler("checkin", checkin_command))  # NEW API check-in
+    app.add_handler(CommandHandler("link", link_command))
+    app.add_handler(CommandHandler("pending", pending_command))
     app.add_handler(CommandHandler("cancel", lambda u, c: u.message.reply_text("❌ Akcija otkazana.") or c.user_data.clear()))
     
     # Handle photo messages (for OCR)
@@ -2166,6 +2217,23 @@ def main():
     # Set up commands menu and scheduled jobs
     async def post_init(application: Application):
         await setup_bot_commands(application)
+
+        # Tokens and pending submissions have to survive a redeploy.
+        await store.init()
+
+        if config.WEB_ENABLED:
+            web_app = build_app(
+                api, store, ocr_service,
+                notify=lambda sid: notify_submission(application.bot, sid),
+            )
+            application.bot_data["web_runner"] = await start_web(web_app)
+            print(f"🌐 Check-in forma na portu {config.WEB_PORT}")
+            pending = await store.pending_submissions()
+            if pending:
+                print(f"📥 {len(pending)} prijava čeka odobrenje (/pending)")
+        else:
+            print("🌐 Check-in forma isključena (WEB_ENABLED=false)")
+
         
         # Schedule daily notification (if job_queue is available)
         job_queue = application.job_queue
@@ -2190,9 +2258,16 @@ def main():
             print("⚠️  No TELEGRAM_ALLOWED_USERS set - notifications disabled")
             print("   Use /notifications in the bot to get your user ID")
     
+    async def post_shutdown(application: Application):
+        runner = application.bot_data.get("web_runner")
+        if runner:
+            await runner.cleanup()
+            logger.info("Check-in form stopped")
+
     # Run bot
     print("✅ Bot is running! Press Ctrl+C to stop.")
     app.post_init = post_init
+    app.post_shutdown = post_shutdown
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

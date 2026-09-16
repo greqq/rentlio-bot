@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="hr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>Prijava — Sun Apartments</title>
+<style>
+  :root {
+    --bg: #f5f3ef; --card: #ffffff; --ink: #1c1b19; --muted: #6b6862;
+    --line: #e2ded6; --accent: #c2703d; --accent-ink: #ffffff;
+    --ok: #2f7d55; --warn: #8a6d1f; --err: #a33a2a;
+    --radius: 14px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17171a; --card: #202024; --ink: #f0eee9; --muted: #a09c94;
+      --line: #32323a; --accent: #d2814c; --accent-ink: #17171a;
+      --ok: #6ec08e; --warn: #d4b45e; --err: #e08776;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 16px; padding-bottom: 48px;
+  }
+  .wrap { max-width: 520px; margin: 0 auto; }
+  header { text-align: center; padding: 8px 0 20px; }
+  header h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  header p { margin: 0; color: var(--muted); font-size: 14px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 16px; margin-bottom: 14px;
+  }
+  .res { display: flex; flex-direction: column; gap: 4px; font-size: 14px; }
+  .res strong { font-size: 16px; }
+  .res span { color: var(--muted); }
+  button {
+    font: inherit; font-weight: 600; border-radius: 11px; border: 1px solid transparent;
+    padding: 14px 16px; width: 100%; cursor: pointer; transition: opacity .15s;
+  }
+  button:active { opacity: .7; }
+  button[disabled] { opacity: .5; cursor: default; }
+  .primary { background: var(--accent); color: var(--accent-ink); }
+  .ghost { background: transparent; color: var(--ink); border-color: var(--line); }
+  .link {
+    background: none; border: none; color: var(--muted); text-decoration: underline;
+    font-weight: 400; padding: 10px; font-size: 14px; width: auto; display: block;
+    margin: 0 auto;
+  }
+  .shoot { text-align: center; padding: 26px 16px; }
+  .shoot .icon { font-size: 40px; line-height: 1; margin-bottom: 10px; }
+  .shoot h2 { font-size: 17px; margin: 0 0 6px; }
+  .shoot p { color: var(--muted); font-size: 14px; margin: 0 0 18px; }
+  input[type=file] { display: none; }
+  label.field { display: block; margin-bottom: 12px; }
+  label.field > span {
+    display: block; font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .04em; color: var(--muted); margin-bottom: 5px;
+  }
+  input[type=text], select {
+    font: inherit; width: 100%; padding: 11px 12px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .guest-head {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 14px; gap: 8px;
+  }
+  .guest-head h3 { font-size: 15px; margin: 0; }
+  .remove {
+    background: none; border: none; color: var(--err); width: auto;
+    padding: 4px 6px; font-size: 13px; font-weight: 600;
+  }
+  .note {
+    font-size: 13px; padding: 10px 12px; border-radius: 10px; margin-bottom: 14px;
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+  }
+  .msg { font-size: 14px; padding: 12px; border-radius: 10px; margin-bottom: 14px; }
+  .msg.err {
+    color: var(--err); background: color-mix(in srgb, var(--err) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--err) 32%, transparent);
+  }
+  .spin { text-align: center; padding: 30px 0; color: var(--muted); font-size: 14px; }
+  .spin .dot {
+    display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+    background: var(--accent); margin: 0 3px; animation: b 1.2s infinite ease-in-out;
+  }
+  .spin .dot:nth-child(2) { animation-delay: .15s; }
+  .spin .dot:nth-child(3) { animation-delay: .3s; }
+  @keyframes b { 0%, 80%, 100% { transform: scale(.6); opacity: .45 } 40% { transform: scale(1); opacity: 1 } }
+  .done { text-align: center; padding: 34px 16px; }
+  .done .icon { font-size: 46px; margin-bottom: 12px; }
+  .done h2 { margin: 0 0 8px; font-size: 19px; }
+  .done p { color: var(--muted); margin: 0; font-size: 15px; }
+  footer {
+    text-align: center; color: var(--muted); font-size: 12px; line-height: 1.6;
+    margin-top: 22px;
+  }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Sun Apartments</h1>
+    <p>Prijava gostiju</p>
+  </header>
+
+  <div class="card res" id="res"></div>
+
+  <div id="stage"></div>
+
+  <footer>
+    Slika se koristi samo za očitavanje podataka i ne čuva se nigdje.<br>
+    Podaci se prosljeđuju u sustav prijave gostiju sukladno zakonu.
+  </footer>
+
+</div>
+
+<input type="file" id="picker" accept="image/*" capture="environment">
+
+<script>
+const TOKEN = "__TOKEN__";
+const RES = __RESERVATION_JSON__;
+const guests = [];
+
+const stage = document.getElementById("stage");
+const picker = document.getElementById("picker");
+
+document.getElementById("res").innerHTML =
+  `<strong>${esc(RES.unitName || "Apartman")}</strong>` +
+  `<span>${esc(RES.arrival || "")} → ${esc(RES.departure || "")}</span>` +
+  (RES.guestName ? `<span>Rezervacija na ime: ${esc(RES.guestName)}</span>` : "");
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g,
+    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+const FIELDS = [
+  ["fullName", "Ime i prezime", "text"],
+  ["dateOfBirth", "Datum rođenja", "text", "DD.MM.GGGG"],
+  ["gender", "Spol", "select", [["", "—"], ["M", "Muško"], ["F", "Žensko"]]],
+  ["nationality", "Državljanstvo", "text"],
+  ["documentType", "Vrsta dokumenta", "select",
+    [["", "—"], ["ID_CARD", "Osobna iskaznica"], ["PASSPORT", "Putovnica"]]],
+  ["documentNumber", "Broj dokumenta", "text"],
+  ["placeOfResidence", "Mjesto prebivališta", "text"],
+  ["address", "Adresa", "text"],
+];
+
+function renderShoot() {
+  const first = guests.length === 0;
+  stage.innerHTML = `
+    <div class="card shoot">
+      <div class="icon">🪪</div>
+      <h2>${first ? "Slikajte osobnu ili putovnicu" : "Slikajte dokument sljedeće osobe"}</h2>
+      <p>Otvorit će se kamera. Slikajte stranu s <strong>strojno čitljivim redovima</strong>
+         (dva reda znakova s &lt;&lt;&lt;), obično na poleđini osobne.</p>
+      <button class="primary" id="shoot">📷 Otvori kameru</button>
+      <button class="link" id="manual">Radije upišem podatke ručno</button>
+    </div>` + (guests.length ? renderList() : "");
+  document.getElementById("shoot").onclick = () => picker.click();
+  document.getElementById("manual").onclick = () => { addGuest({}); };
+  wireList();
+}
+
+function renderList() {
+  if (!guests.length) return "";
+  return guests.map((g, i) => `
+    <div class="card">
+      <div class="guest-head">
+        <h3>${i + 1}. osoba</h3>
+        <button class="remove" data-rm="${i}">Ukloni</button>
+      </div>
+      ${g._ocr ? `<div class="note">⚠️ Čitač ne vidi kvačice — provjerite
+         <strong>č, ć, ž, š, đ</strong> u imenu i ispravite ako treba.</div>` : ""}
+      ${FIELDS.map(f => fieldHtml(f, g, i)).join("")}
+    </div>`).join("") + `
+    <div class="card">
+      <button class="ghost" id="more">➕ Dodaj još jednu osobu</button>
+    </div>
+    <div class="card">
+      <button class="primary" id="send">✅ Podaci su točni, pošalji</button>
+    </div>`;
+}
+
+function fieldHtml([key, label, kind, extra], g, i) {
+  const v = g[key] || "";
+  if (kind === "select") {
+    return `<label class="field"><span>${label}</span><select data-i="${i}" data-k="${key}">` +
+      extra.map(([val, txt]) =>
+        `<option value="${val}"${val === v ? " selected" : ""}>${txt}</option>`).join("") +
+      `</select></label>`;
+  }
+  return `<label class="field"><span>${label}</span>` +
+    `<input type="text" data-i="${i}" data-k="${key}" value="${esc(v)}"` +
+    (extra ? ` placeholder="${extra}"` : "") + `></label>`;
+}
+
+function wireList() {
+  stage.querySelectorAll("[data-k]").forEach(el => {
+    el.oninput = el.onchange = () => {
+      guests[+el.dataset.i][el.dataset.k] = el.value;
+    };
+  });
+  stage.querySelectorAll("[data-rm]").forEach(el => {
+    el.onclick = () => { guests.splice(+el.dataset.rm, 1); renderShoot(); };
+  });
+  const more = document.getElementById("more");
+  if (more) more.onclick = () => picker.click();
+  const send = document.getElementById("send");
+  if (send) send.onclick = submit;
+}
+
+function addGuest(data) {
+  guests.push(data);
+  renderShoot();
+  // Land the person on the fields they just filled, not back at the camera.
+  const cards = stage.querySelectorAll(".card");
+  if (cards.length > 1) cards[cards.length - 3]?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function spinner(text) {
+  stage.innerHTML = `<div class="card spin">
+    <div><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+    <div style="margin-top:12px">${esc(text)}</div></div>`;
+}
+
+function errorBox(text) {
+  renderShoot();
+  stage.insertAdjacentHTML("afterbegin", `<div class="msg err">${esc(text)}</div>`);
+}
+
+picker.onchange = async () => {
+  const file = picker.files && picker.files[0];
+  picker.value = "";
+  if (!file) return;
+
+  spinner("Čitam dokument…");
+  const body = new FormData();
+  body.append("image", file, file.name || "id.jpg");
+
+  try {
+    const r = await fetch(`/checkin/${TOKEN}/scan`, { method: "POST", body });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data.ok) {
+      errorBox(data.error || "Nisam uspio pročitati dokument. Pokušajte ponovno s boljim osvjetljenjem, ili upišite podatke ručno.");
+      return;
+    }
+    addGuest({ ...data.guest, _ocr: true });
+  } catch (e) {
+    errorBox("Nema veze s internetom. Pokušajte ponovno.");
+  }
+};
+
+async function submit() {
+  const bad = guests.findIndex(g => !(g.fullName || "").trim());
+  if (bad !== -1) {
+    alert(`Upišite ime i prezime za ${bad + 1}. osobu.`);
+    return;
+  }
+
+  spinner("Šaljem podatke…");
+  try {
+    const r = await fetch(`/checkin/${TOKEN}/submit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ guests: guests.map(({ _ocr, ...g }) => g) }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data.ok) {
+      errorBox(data.error || "Slanje nije uspjelo. Pokušajte ponovno.");
+      return;
+    }
+    stage.innerHTML = `<div class="card done">
+      <div class="icon">✅</div>
+      <h2>Hvala, primljeno!</h2>
+      <p>Podaci su poslani domaćinu. Ne treba vam ništa dalje —
+         vidimo se na dolasku.</p></div>`;
+    document.querySelector("footer").classList.add("hidden");
+  } catch (e) {
+    errorBox("Nema veze s internetom. Pokušajte ponovno.");
+  }
+}
+
+renderShoot();
+</script>
+</body>
+</html>
