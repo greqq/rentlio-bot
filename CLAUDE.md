@@ -35,7 +35,9 @@ To skip the wait, on the Pi: `docker compose pull rentlio-bot && docker compose 
 Consequences to keep in mind:
 
 - **Only what the Dockerfile COPYs exists in production.** It copies `src/`
-  and `scripts/`. A file added anywhere else will not be there.
+  and `scripts/`. A file added anywhere else will not be there - and a path
+  listed in `.dockerignore` fails the COPY outright rather than being skipped,
+  so the two files have to agree.
 - One-off scripts run *inside the container*:
   `docker compose exec rentlio-bot python scripts/analyze_occupancy.py --days 30`
 - Config is environment only - `env_file: .env` next to `docker-compose.yml`,
