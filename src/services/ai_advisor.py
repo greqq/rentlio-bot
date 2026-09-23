@@ -34,11 +34,16 @@ Tvoj zadatak je napisati kratki, konkretan brief na hrvatskom jeziku:
 kad je bitno, i konkretnim potezom (spusti cijenu za X%, min. boravak na N noci, \
 otvori 1 noc, ostavi kako jest).
 3. "Prati" - najvise 3 tocke za termine koji jos nisu hitni.
-4. Ako podaci nesto ne pokrivaju (npr. tempo bookinga je procijenjen, a ne \
-izmjeren), reci to u jednoj recenici na kraju.
+4. Ako podaci nesto ne pokrivaju, reci to u jednoj recenici na kraju.
 
 Pravila:
 - Racunaj iskljucivo iz dobivenog JSON-a. Ne izmisljaj datume, cijene ni brojeve.
+- Polje sazetak.izvor_tempa je jedini izvor istine o tome kako je izracunat \
+ocekivani tempo: "history" znaci da je izmjeren iz stvarnih datuma kreiranja \
+rezervacija ovog racuna, "heuristic" da je procijenjen iz tipicne krivulje, \
+"none" da povijesti nema. Nikad ne tvrdi suprotno od te vrijednosti - ogradu \
+da tempo nije izmjeren pisi samo ako pise "heuristic". Broj sezona u \
+sazetak.godine_povijesti smijes komentirati neovisno o tome.
 - Preporuke motora su polazna tocka; smijes ih spojiti, presloziti po vaznosti \
 ili odbaciti ako se kose s podacima, ali objasni zasto u pola recenice.
 - Pisi bez markdown zvjezdica i bez tablica - obican tekst s emoji oznakama, \

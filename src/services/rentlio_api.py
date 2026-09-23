@@ -127,9 +127,17 @@ class RentlioAPI:
         method: str, 
         endpoint: str, 
         params: dict = None, 
-        json_data: dict = None
+        json_data: dict = None,
+        quiet_statuses: tuple = ()
     ) -> dict:
-        """Make an API request"""
+        """
+        Make an API request.
+
+        quiet_statuses lists status codes this caller expects and handles, so
+        they are logged at debug instead of error. Rentlio exposes different
+        endpoints per account, and a probe that legitimately 404s should not
+        look like a failure in the bot's logs.
+        """
         session = await self._get_session()
         url = f"{self.base_url}{endpoint}"
         
@@ -155,7 +163,10 @@ class RentlioAPI:
                             msg = str(errors)
                     if not msg:
                         msg = str(response_data)
-                    logger.error(f"API Error {response.status}: {msg} | Full response: {response_data}")
+                    if response.status in quiet_statuses:
+                        logger.debug(f"API {response.status} (expected): {method} {endpoint} - {msg}")
+                    else:
+                        logger.error(f"API Error {response.status}: {msg} | Full response: {response_data}")
                     raise RentlioAPIError(
                         status_code=response.status,
                         message=msg,
@@ -189,6 +200,19 @@ class RentlioAPI:
         flat list. Returns [] instead of raising when neither exists - the
         caller can still derive unit names from reservations.
         """
+        quiet = (400, 403, 404, 405)
+
+        # The flat /units endpoint does not exist on every account, while the
+        # property-scoped one does - so find the property first rather than
+        # letting the fallback log a 404 on every analysis.
+        if not property_id:
+            try:
+                properties = await self.get_properties()
+            except RentlioAPIError:
+                properties = []
+            if len(properties) == 1:
+                property_id = str(properties[0].get("id", "")) or None
+
         endpoints = []
         if property_id:
             endpoints.append(f"/properties/{property_id}/units")
@@ -196,9 +220,9 @@ class RentlioAPI:
 
         for endpoint in endpoints:
             try:
-                response = await self._request("GET", endpoint)
+                response = await self._request("GET", endpoint, quiet_statuses=quiet)
             except RentlioAPIError as e:
-                if e.status_code in (400, 403, 404, 405):
+                if e.status_code in quiet:
                     continue
                 raise
             if isinstance(response, list):
