@@ -41,7 +41,8 @@ test-results/
 .DS_Store
 Thumbs.db
 
-# Documentation (except readme)
+# Documentation (except readme and the repo guide)
 *.md
 !readme.md
+!CLAUDE.md
 gen-lang-client*.json
