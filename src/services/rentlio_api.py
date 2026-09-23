@@ -127,9 +127,17 @@ class RentlioAPI:
         method: str, 
         endpoint: str, 
         params: dict = None, 
-        json_data: dict = None
+        json_data: dict = None,
+        quiet_statuses: tuple = ()
     ) -> dict:
-        """Make an API request"""
+        """
+        Make an API request.
+
+        quiet_statuses lists status codes this caller expects and handles, so
+        they are logged at debug instead of error. Rentlio exposes different
+        endpoints per account, and a probe that legitimately 404s should not
+        look like a failure in the bot's logs.
+        """
         session = await self._get_session()
         url = f"{self.base_url}{endpoint}"
         
@@ -155,7 +163,10 @@ class RentlioAPI:
                             msg = str(errors)
                     if not msg:
                         msg = str(response_data)
-                    logger.error(f"API Error {response.status}: {msg} | Full response: {response_data}")
+                    if response.status in quiet_statuses:
+                        logger.debug(f"API {response.status} (expected): {method} {endpoint} - {msg}")
+                    else:
+                        logger.error(f"API Error {response.status}: {msg} | Full response: {response_data}")
                     raise RentlioAPIError(
                         status_code=response.status,
                         message=msg,
@@ -189,6 +200,19 @@ class RentlioAPI:
         flat list. Returns [] instead of raising when neither exists - the
         caller can still derive unit names from reservations.
         """
+        quiet = (400, 403, 404, 405)
+
+        # The flat /units endpoint does not exist on every account, while the
+        # property-scoped one does - so find the property first rather than
+        # letting the fallback log a 404 on every analysis.
+        if not property_id:
+            try:
+                properties = await self.get_properties()
+            except RentlioAPIError:
+                properties = []
+            if len(properties) == 1:
+                property_id = str(properties[0].get("id", "")) or None
+
         endpoints = []
         if property_id:
             endpoints.append(f"/properties/{property_id}/units")
@@ -196,9 +220,9 @@ class RentlioAPI:
 
         for endpoint in endpoints:
             try:
-                response = await self._request("GET", endpoint)
+                response = await self._request("GET", endpoint, quiet_statuses=quiet)
             except RentlioAPIError as e:
-                if e.status_code in (400, 403, 404, 405):
+                if e.status_code in quiet:
                     continue
                 raise
             if isinstance(response, list):
@@ -208,6 +232,79 @@ class RentlioAPI:
                 return data
         return []
     
+    # ========== Unit types: live rates, restrictions ==========
+
+    async def get_unit_types(self, property_id: str) -> list[dict]:
+        """Unit types of a property - rates and restrictions hang off these."""
+        response = await self._request("GET", f"/properties/{property_id}/unit-types")
+        if isinstance(response, list):
+            return response
+        return response.get("data", [])
+
+    async def _date_series(
+        self,
+        endpoint: str,
+        date_from: str,
+        date_to: str,
+        max_pages: int = 10,
+    ) -> list[dict]:
+        """
+        Read one of the per-date series (rates / restrictions / availability).
+
+        They answer {"data": [{...,"date": "YYYY-mm-dd"}], "perPage": n,
+        "total": n} and page like the rest of the API, so a 60 day horizon
+        across both apartments must not stop at the first page.
+        """
+        collected: list[dict] = []
+        for page in range(1, max_pages + 1):
+            response = await self._request(
+                "GET",
+                endpoint,
+                params={
+                    "dateFrom": date_from,
+                    "dateTo": date_to,
+                    "perPage": 100,
+                    "page": page,
+                },
+            )
+            batch = response.get("data", []) if isinstance(response, dict) else response
+            if not batch:
+                break
+            collected.extend(batch)
+
+            total = response.get("total") if isinstance(response, dict) else None
+            if isinstance(total, int) and len(collected) >= total:
+                break
+            if len(batch) < 100:
+                break
+        return collected
+
+    async def get_unit_type_rates(
+        self, unit_type_id: str, date_from: str, date_to: str
+    ) -> list[dict]:
+        """
+        Price per date for a unit type: [{"price": 65, "date": "2026-07-03"}].
+
+        This is the standard rate - the API documents these endpoints as
+        listing the standard rate only, which is the one the host actually
+        edits; channel-specific plans are derived from it.
+        """
+        return await self._date_series(
+            f"/unit-types/{unit_type_id}/rates", date_from, date_to
+        )
+
+    async def get_unit_type_restrictions(
+        self, unit_type_id: str, date_from: str, date_to: str
+    ) -> list[dict]:
+        """
+        Restrictions per date: [{"minStay": 2, "closed": false, "date": ...}].
+
+        minStay 0 means no minimum is set for that night.
+        """
+        return await self._date_series(
+            f"/unit-types/{unit_type_id}/restrictions", date_from, date_to
+        )
+
     # ========== Reservations ==========
     
     async def get_reservations(

@@ -34,16 +34,35 @@ Tvoj zadatak je napisati kratki, konkretan brief na hrvatskom jeziku:
 kad je bitno, i konkretnim potezom (spusti cijenu za X%, min. boravak na N noci, \
 otvori 1 noc, ostavi kako jest).
 3. "Prati" - najvise 3 tocke za termine koji jos nisu hitni.
-4. Ako podaci nesto ne pokrivaju (npr. tempo bookinga je procijenjen, a ne \
-izmjeren), reci to u jednoj recenici na kraju.
+4. Ako podaci nesto ne pokrivaju, reci to u jednoj recenici na kraju.
 
 Pravila:
 - Racunaj iskljucivo iz dobivenog JSON-a. Ne izmisljaj datume, cijene ni brojeve.
+- Polje sazetak.izvor_tempa je jedini izvor istine o tome kako je izracunat \
+ocekivani tempo: "history" znaci da je izmjeren iz stvarnih datuma kreiranja \
+rezervacija ovog racuna, "heuristic" da je procijenjen iz tipicne krivulje, \
+"none" da povijesti nema. Nikad ne tvrdi suprotno od te vrijednosti - ogradu \
+da tempo nije izmjeren pisi samo ako pise "heuristic". Broj sezona u \
+sazetak.godine_povijesti smijes komentirati neovisno o tome.
+- Kad dan ima cijena_sada_eur, racunaj popuste iz te cijene i navedi i \
+trenutnu i ciljanu ("sada 60, spusti na 51"). Povijesnu cijenu spominji samo \
+kao usporedbu. Ako je sazetak.trenutne_cijene_ucitane false, nemas trenutne \
+cijene i racunas iz povijesnih.
+- sazetak.donja_granica_cijene_eur je najniza cijena po apartmanu koju \
+vlasnik zeli vidjeti. Nikad ne predlazi nizu; ako racun ispadne nizi, \
+predlozi granicu i reci da dalje nema smisla.
+- Rupu od jedne noci nikad ne rjesavaj popustom. Jedna noc nosi isti trosak \
+ciscenja kao dulji boravak, pa je jednonocni cjenik namjerno skuplji - tu se \
+otvara min. boravak na 1 i po potrebi nudi produljenje gostu prije ili \
+poslije, a cijena ostaje.
+- min_boravak_sada govori koliko je min. boravak stvarno postavljen po \
+apartmanu. Nikad ne predlazi promjenu na vrijednost koja je vec postavljena; \
+ako rupa stane u postojeci min. boravak, problem je cijena, ne restrikcija.
 - Preporuke motora su polazna tocka; smijes ih spojiti, presloziti po vaznosti \
 ili odbaciti ako se kose s podacima, ali objasni zasto u pola recenice.
 - Pisi bez markdown zvjezdica i bez tablica - obican tekst s emoji oznakama, \
 jer se salje u Telegram.
-- Kratko: najvise 2500 znakova. Bez uvoda i bez pozdrava.
+- Kratko: najvise 2500 znakova. Bez uvoda i bez pozdrava.\n- Pisi hrvatski s dijakritickim znakovima (c, c, z, s, d).
 - Cijene su u eurima. Datume pisi kao 12.09."""
 
 

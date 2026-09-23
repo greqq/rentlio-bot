@@ -51,9 +51,9 @@ Consequences to keep in mind:
 ## Language
 
 **All user-facing bot text is Croatian.** Code, comments, commit messages and
-docs are English. Croatian strings in the source avoid diacritics in the newer
-modules (c/z/s instead of ć/ž/š) because some output paths are plain text -
-match whatever the file around you already does.
+docs are English. The occupancy report uses proper diacritics - it is plain
+text in a Telegram message, so nothing forces the stripped spelling. Older
+modules mix both; match whatever the file around you already does.
 
 ## Layout
 
@@ -94,6 +94,66 @@ in `setup_bot_commands()`, and in `help_command()`.
   something exists, **probe rather than assume**:
   `python scripts/api_capability_scan.py` prints status codes and field shapes
   (redacted by default; `--raw` includes guest PII).
+
+### Endpoint map (probed live 2026-09-23)
+
+Property `26022`; unit types `52887` Sunrise and `52888` Sunset. Note that
+unit **types** and unit **ids** differ - `/unit-types/<unit id>/...` answers
+403, which reads like a permission problem but is just the wrong id.
+
+Answers 200: `/properties`, `/properties/{id}/units`, `/properties/{id}/unit-types`,
+`/properties/{id}/rates` (rate plan definitions, as a **bare list**, not
+`{"data": [...]}`), `/reservations`, `/reservations/{id}/details|guests|invoices`,
+`/reservations-guests/{id}`, `/invoices`, `/webhooks`, most `/enums/*`.
+
+Does not exist (404): `/units`, `/guests`, `/rates`, `/rate-plans`,
+`/unit-types`, `/calendar`, `/restrictions`, `/prices`, `/tourist-tax`,
+`/evisitor`, `/online-checkin`, `/messages`, `/account`, `/me`,
+`/properties/{id}/rate-plans|settings|webhooks`.
+
+**Current prices and minimum stay are read from the unit-type endpoints**,
+which are the ones that carry per-date values:
+
+```
+GET /unit-types/{unitTypeId}/rates         -> [{"price": 65, "date": "2026-07-03"}]
+GET /unit-types/{unitTypeId}/restrictions  -> [{"minStay": 2, "closed": false, "date": ...}]
+GET /unit-types/{unitTypeId}/availability  -> [{"availability": 0, "date": ...}]
+```
+
+All three take `dateFrom`/`dateTo` (both required for the filter to apply) and
+page with `perPage`/`page`. They serve the **standard rate** only, which is
+the one the host edits. Per rate plan there is
+`GET /unit-types/{unitTypeId}/rates/{ratePlanId}`, and writes go to
+`POST /unit-types/{id}/availrates` or
+`POST /unit-types/{unitTypeId}/rates-restrictions/{ratePlanId}` - those
+propagate to the connected OTA channels, so nothing writes without the host
+asking for it.
+
+`/availability?propertiesIds=&dateFrom=&dateTo=` is a different thing than its
+name suggests: it lists unit types that are free for **every** day of the
+period, so it legitimately answers `200 []` whenever any night in the range is
+booked. It is not a way to read rates, and an empty answer from it is not a
+sign of anything being broken.
+
+## Pricing rules that came from the host, not from theory
+
+- **A one-night gap is never discounted.** A single night costs the same to
+  clean as a five-night stay, which is why the host's own rate card prices
+  1 night *above* the 2+ and 3+ tiers (e.g. Sunrise Booking: 70 / 60 / 55).
+  Advising a discount there hands back a premium that was set deliberately -
+  the only lever is opening the minimum stay, plus offering the neighbouring
+  guest an extension, which costs no turnaround at all.
+- **`PRICE_FLOORS` caps every discount.** Below the floor a night stops paying
+  for its turnaround. When the floor makes the remaining discount negligible
+  (<3%), the report says the price lever is spent and points at minimum stay
+  or direct bookings instead of advising a 1% cut.
+- **Direct beats OTA by more than a discount usually recovers.** On this rate
+  card a 2-night direct stay nets ~84 EUR against ~72 EUR through Booking, so
+  pushing the direct rate is worth more than shaving the OTA price.
+- Rates read from the API are the **standard rate** (the Booking rate card);
+  the channel-specific plans derive from it. The report says just "cijena" -
+  the host knows which card that is, and the qualifier cost a line on every
+  recommendation.
 
 ## Anthropic usage
 
