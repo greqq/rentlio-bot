@@ -197,6 +197,9 @@ async def run_analysis(
 
     rate_calendar = await _fetch_rate_calendar(api, property_id, today, end)
 
+    if pricing is None:
+        pricing = PricingConfig(price_floors=dict(config.PRICE_FLOORS))
+
     analyzer = OccupancyAnalyzer(pricing)
     report = analyzer.analyze(
         today=today,

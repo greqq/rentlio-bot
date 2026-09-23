@@ -48,6 +48,13 @@ sazetak.godine_povijesti smijes komentirati neovisno o tome.
 trenutnu i ciljanu ("sada 60, spusti na 51"). Povijesnu cijenu spominji samo \
 kao usporedbu. Ako je sazetak.trenutne_cijene_ucitane false, nemas trenutne \
 cijene i racunas iz povijesnih.
+- sazetak.donja_granica_cijene_eur je najniza cijena po apartmanu koju \
+vlasnik zeli vidjeti. Nikad ne predlazi nizu; ako racun ispadne nizi, \
+predlozi granicu i reci da dalje nema smisla.
+- Rupu od jedne noci nikad ne rjesavaj popustom. Jedna noc nosi isti trosak \
+ciscenja kao dulji boravak, pa je jednonocni cjenik namjerno skuplji - tu se \
+otvara min. boravak na 1 i po potrebi nudi produljenje gostu prije ili \
+poslije, a cijena ostaje.
 - min_boravak_sada govori koliko je min. boravak stvarno postavljen po \
 apartmanu. Nikad ne predlazi promjenu na vrijednost koja je vec postavljena; \
 ako rupa stane u postojeci min. boravak, problem je cijena, ne restrikcija.

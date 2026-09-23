@@ -29,6 +29,19 @@ class Config:
     RENTLIO_PROPERTY_ID: str = os.getenv("RENTLIO_PROPERTY_ID", "")
     RENTLIO_TOTAL_UNITS: int = int(os.getenv("RENTLIO_TOTAL_UNITS", "0") or 0)
 
+    # Lowest listed price worth recommending per apartment, as
+    # "Sunrise:50,Sunset:55". Taken from the host's own rate card - the
+    # cheapest tier they already sell at - so the analysis never advises a
+    # discount that stops paying for the turnaround. Empty disables the floor.
+    PRICE_FLOORS: dict = {
+        name.strip(): float(value)
+        for name, _, value in (
+            pair.partition(":")
+            for pair in os.getenv("PRICE_FLOORS", "").split(",")
+        )
+        if name.strip() and value.strip()
+    }
+
     # Anthropic (optional) - writes the occupancy analysis up in plain Croatian.
     # Without a key the bot still produces the full rule-based report.
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")

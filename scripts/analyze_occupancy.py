@@ -23,8 +23,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.services import occupancy_service  # noqa: E402
+from src.config import config  # noqa: E402
 from src.services.occupancy_analyzer import (  # noqa: E402
     OccupancyAnalyzer,
+    PricingConfig,
     RateInfo,
     Stay,
     shift_years,
@@ -54,7 +56,7 @@ def build_demo_report(days: int):
                         unit=unit,
                         arrival=cursor,
                         departure=departure,
-                        total_price=nights * rng.uniform(85, 135),
+                        total_price=nights * rng.uniform(55, 72),
                         channel=rng.choice(["Booking.com", "Airbnb", "Direct"]),
                         guest_name="Demo",
                         booked_on=cursor - timedelta(days=rng.randint(5, 90)),
@@ -87,13 +89,15 @@ def build_demo_report(days: int):
             day = today + timedelta(days=offset)
             weekend = day.weekday() >= 4
             per_day[day] = RateInfo(
-                price=round(rng.uniform(95, 125) + (15 if weekend else 0)),
+                price=round(rng.uniform(58, 68) + (7 if weekend else 0)),
                 min_stay=2,
                 closed=False,
             )
         rate_calendar[unit] = per_day
 
-    return OccupancyAnalyzer().analyze(
+    return OccupancyAnalyzer(
+        PricingConfig(price_floors=dict(config.PRICE_FLOORS))
+    ).analyze(
         today=today,
         horizon_days=days,
         current_stays=current,

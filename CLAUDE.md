@@ -135,6 +135,24 @@ period, so it legitimately answers `200 []` whenever any night in the range is
 booked. It is not a way to read rates, and an empty answer from it is not a
 sign of anything being broken.
 
+## Pricing rules that came from the host, not from theory
+
+- **A one-night gap is never discounted.** A single night costs the same to
+  clean as a five-night stay, which is why the host's own rate card prices
+  1 night *above* the 2+ and 3+ tiers (e.g. Sunrise Booking: 70 / 60 / 55).
+  Advising a discount there hands back a premium that was set deliberately -
+  the only lever is opening the minimum stay, plus offering the neighbouring
+  guest an extension, which costs no turnaround at all.
+- **`PRICE_FLOORS` caps every discount.** Below the floor a night stops paying
+  for its turnaround. When the floor makes the remaining discount negligible
+  (<3%), the report says the price lever is spent and points at minimum stay
+  or direct bookings instead of advising a 1% cut.
+- **Direct beats OTA by more than a discount usually recovers.** On this rate
+  card a 2-night direct stay nets ~84 EUR against ~72 EUR through Booking, so
+  pushing the direct rate is worth more than shaving the OTA price.
+- Rates read from the API are the **standard rate**; the channel-specific
+  plans derive from it. The report says "standardna cijena" for that reason.
+
 ## Anthropic usage
 
 `src/services/ai_advisor.py` is the only place that calls Claude. Rules:
