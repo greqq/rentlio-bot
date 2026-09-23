@@ -845,13 +845,46 @@ class OccupancyAnalyzer:
             first_day = by_day.get(gap.start)
             current_min = first_day.current_min_stay(gap.unit) if first_day else None
             current_price = first_day.current_price(gap.unit) if first_day else None
-            blocked = current_min is None or current_min > gap.nights
-            discount = _discount_for_lead(gap.lead_days, cfg)
+            # "No minimum set" and "we could not read the minimum" look the
+            # same once minStay 0 becomes None, and they mean opposite things:
+            # the first leaves the gap bookable, the second is unknown. Only
+            # the presence of rate data for this apartment tells them apart.
+            known = first_day is not None and gap.unit in first_day.rates
+            blocked = (current_min or 0) > gap.nights if known else True
+            discount, target_price = _apply_discount(
+                current_price,
+                _discount_for_lead(gap.lead_days, cfg),
+                cfg.price_floors.get(gap.unit),
+            )
             where = f"{_fmt_range(gap.start, gap.end)} · {gap.unit}"
             nights_word = "noć" if gap.nights == 1 else "noći"
             min_now = f" (sada min. {current_min})" if current_min else ""
 
-            if blocked and gap.nights <= cfg.premium_gap_nights:
+            if not blocked and gap.nights <= cfg.premium_gap_nights:
+                actions.append(Action(
+                    kind="info",
+                    title=where,
+                    move="Ponudi produljenje gostu prije ili poslije",
+                    why=(
+                        "Ništa je ne blokira — min. boravak nije postavljen"
+                        if not current_min else
+                        f"Ništa je ne blokira — min. boravak je {current_min}"
+                    ) + (
+                        ". Jedna noć ipak teško ide sama, a produljenje ti je "
+                        "najbolji ishod jer nema novog čišćenja. Cijenu ne diraj."
+                    ),
+                    start=gap.start,
+                    end=gap.end,
+                    priority=2,
+                    unit=gap.unit,
+                    value_at_risk=gap.lost_value,
+                    metrics={
+                        "noci": gap.nights,
+                        "dana_do": gap.lead_days,
+                        "min_boravak_sada": current_min,
+                    },
+                ))
+            elif blocked and gap.nights <= cfg.premium_gap_nights:
                 # The restriction is the whole problem. A single night is meant
                 # to be the expensive one, so the price stays where it is.
                 actions.append(Action(
@@ -877,11 +910,12 @@ class OccupancyAnalyzer:
                 ))
             elif blocked:
                 price_move = ""
-                if current_price:
-                    target = current_price * (100 - discount) / 100
+                if current_price and discount >= 3:
                     price_move = (
-                        f", cijena {current_price:.0f} € → {target:.0f} € (−{discount}%)"
+                        f", cijena {current_price:.0f} € → {target_price:.0f} € (−{discount}%)"
                     )
+                elif current_price:
+                    price_move = f", cijena ostaje {current_price:.0f} € (već na dnu)"
                 actions.append(Action(
                     kind="min_stay",
                     title=where,
@@ -907,17 +941,23 @@ class OccupancyAnalyzer:
                 # The minimum already lets this gap be booked, so the only
                 # lever left is the price.
                 move = f"Spusti −{discount}%"
-                if current_price:
-                    target = current_price * (100 - discount) / 100
-                    move = f"{current_price:.0f} € → {target:.0f} € (−{discount}%)"
+                if current_price and discount >= 3:
+                    move = f"{current_price:.0f} € → {target_price:.0f} € (−{discount}%)"
+                elif current_price:
+                    move = f"Cijena je već na dnu ({current_price:.0f} €)"
                 actions.append(Action(
                     kind="discount",
                     title=where,
                     move=move,
                     why=(
                         f"Rupa od {gap.nights} {nights_word} između dvije rezervacije. "
-                        f"Min. boravak je već {current_min}, termin je vidljiv — "
-                        "ostaje cijena."
+                        + (
+                            f"Min. boravak je već {current_min}, termin je vidljiv"
+                            if current_min else
+                            "Min. boravak nije postavljen, termin je vidljiv"
+                        )
+                        + " — ostaje cijena."
+                        + _neighbour_note(days, gap.start, gap.end, gap.unit)
                     ),
                     start=gap.start,
                     end=gap.end,
@@ -970,14 +1010,14 @@ class OccupancyAnalyzer:
             why_tail = (
                 f"Prazno {free_nights} noćenja, prijašnjih sezona ~"
                 f"{(hist_avg or 0) * 100:.0f}%. Do prve noći {lead} dana."
+                + _neighbour_note(days, first.day, last.day)
             )
 
             if live_prices:
                 avg_price = sum(live_prices) / len(live_prices)
-                target = avg_price * (100 - discount) / 100
-                if floor and target < floor:
-                    target = floor
-                    discount = max(0, round((1 - target / avg_price) * 100))
+                capped_before = discount
+                discount, target = _apply_discount(avg_price, discount, floor)
+                if discount < capped_before:
                     if discount < 3:
                         # The price lever is spent. "Cut it by 1%" is noise;
                         # what the host needs is to hear the answer is not price.
@@ -1130,7 +1170,7 @@ class OccupancyAnalyzer:
                 ))
 
         actions.sort(key=lambda a: (a.priority, -a.value_at_risk, a.start))
-        return actions
+        return _dedupe(actions)
 
 
 # ========== small helpers ==========
@@ -1154,6 +1194,102 @@ def _contiguous(days: list[DayStat], predicate) -> list[list[DayStat]]:
     if current:
         runs.append(current)
     return runs
+
+
+def _apply_discount(
+    price: Optional[float],
+    discount: int,
+    floor: Optional[float],
+) -> tuple[int, Optional[float]]:
+    """
+    Cut `price` by `discount`, never below `floor`.
+
+    Returns the discount that survives the floor together with the target, so
+    a caller cannot quote one and apply the other. Every branch that proposes
+    a price goes through here - the floor was once applied to slow stretches
+    only, which let a short gap be advised below it.
+    """
+    if not price:
+        return discount, None
+    target = price * (100 - discount) / 100
+    if floor and target < floor:
+        target = floor
+        discount = max(0, round((1 - target / price) * 100))
+    return discount, target
+
+
+def _dedupe(actions: list[Action]) -> list[Action]:
+    """
+    Drop a second action saying the same thing about the same nights.
+
+    The gap pass and the pace pass can land on one stretch from different
+    directions - a short gap that is also behind schedule. Both are right, but
+    the host only needs to be told once, and the one naming the apartment is
+    the more useful of the two.
+    """
+    best: dict[tuple, Action] = {}
+    order: list[tuple] = []
+    for action in actions:
+        key = (action.kind, action.start, action.end)
+        existing = best.get(key)
+        if existing is None:
+            best[key] = action
+            order.append(key)
+        elif action.unit and not existing.unit:
+            best[key] = action
+    return [best[key] for key in order]
+
+
+def _neighbour_note(
+    days: list[DayStat],
+    start: date,
+    end: date,
+    unit: Optional[str] = None,
+) -> str:
+    """One sentence, only when the range is priced clearly above its neighbours."""
+    compared = _price_vs_neighbours(days, start, end, unit)
+    if not compared:
+        return ""
+    here, around = compared
+    if here <= around * 1.05:
+        return ""
+    return f" Usto je skuplje od okolnih dana ({here:.0f} € vs ~{around:.0f} €)."
+
+
+def _price_vs_neighbours(
+    days: list[DayStat],
+    start: date,
+    end: date,
+    unit: Optional[str] = None,
+    window: int = 7,
+) -> Optional[tuple[float, float]]:
+    """
+    Listed price over a range against the fortnight around it.
+
+    This is the comparison the host makes by eye when they scroll the calendar
+    row: an empty stretch priced above its own neighbours is a different
+    problem from one priced in line with them, and the pace comparison alone
+    cannot see it.
+    """
+    here: list[float] = []
+    around: list[float] = []
+    for day in days:
+        if unit:
+            prices = [p for p in [day.current_price(unit)] if p]
+        else:
+            prices = [i.price for i in day.rates.values() if i.price]
+        if not prices:
+            continue
+        average = sum(prices) / len(prices)
+        if start <= day.day <= end:
+            here.append(average)
+        elif start - timedelta(days=window) <= day.day <= end + timedelta(days=window):
+            around.append(average)
+
+    if not here or not around:
+        return None
+    around.sort()
+    return sum(here) / len(here), around[len(around) // 2]
 
 
 def _split_by(days: list[DayStat], key) -> list[list[DayStat]]:

@@ -153,7 +153,17 @@ sign of anything being broken.
 - **Direct beats OTA by more than a discount usually recovers.** On this rate
   card a 2-night direct stay nets ~84 EUR against ~72 EUR through Booking, so
   pushing the direct rate is worth more than shaving the OTA price.
-- Rates read from the API are the **standard rate** (the Booking rate card);
+- **`minStay` 0 means no minimum is set, which is the opposite of unknown.**
+  Once 0 becomes None the two look identical, and reading "not set" as
+  "unknown" makes the report advise a restriction change on a gap nothing was
+  blocking. Only the presence of rate data for that apartment tells them
+  apart.
+- **Every price a recommendation quotes goes through `_apply_discount`**, so
+  the floor cannot be skipped. It was once applied to slow stretches only,
+  which let a short gap be advised below it.
+- Rates read from the API are the **standard rate** (the Booking rate card,
+  confirmed against the live calendar: the standard row and the Booking.com
+  row carry identical numbers, and the direct plan sits 5 EUR below both);
   the channel-specific plans derive from it. The report says just "cijena" -
   the host knows which card that is, and the qualifier cost a line on every
   recommendation.
