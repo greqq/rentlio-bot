@@ -95,6 +95,33 @@ in `setup_bot_commands()`, and in `help_command()`.
   `python scripts/api_capability_scan.py` prints status codes and field shapes
   (redacted by default; `--raw` includes guest PII).
 
+### Endpoint map (probed live 2026-09-23)
+
+Property `26022`; unit types `52887` Sunrise and `52888` Sunset. Note that
+unit **types** and unit **ids** differ - `/unit-types/<unit id>/...` answers
+403, which reads like a permission problem but is just the wrong id.
+
+Answers 200: `/properties`, `/properties/{id}/units`, `/properties/{id}/unit-types`,
+`/properties/{id}/rates` (rate plan definitions, as a **bare list**, not
+`{"data": [...]}`), `/reservations`, `/reservations/{id}/details|guests|invoices`,
+`/reservations-guests/{id}`, `/invoices`, `/webhooks`, most `/enums/*`.
+
+Does not exist (404): `/units`, `/guests`, `/rates`, `/rate-plans`,
+`/unit-types`, `/calendar`, `/restrictions`, `/prices`, `/tourist-tax`,
+`/evisitor`, `/online-checkin`, `/messages`, `/account`, `/me`,
+`/properties/{id}/rate-plans|settings|webhooks`.
+
+**Current prices and minimum stay cannot be read.** `/availability` exists and
+validates its parameters (`propertiesIds`, `dateFrom`, `dateTo`, optionally
+`unitTypesIds` / `ratePlansIds`; it rejects `from`/`to` and demands both
+dates), but returns `200` with an empty list for every combination tried -
+including peak-season July with each real rate plan id. Rentlio documents an
+endpoint that *updates* rates, availability and restrictions per unit type, so
+this is almost certainly write-only in practice for this account. Do not
+re-investigate this without a new reason: the occupancy analysis therefore
+compares against what past bookings actually sold for, not against the current
+rate card, and that is a deliberate limitation rather than an oversight.
+
 ## Anthropic usage
 
 `src/services/ai_advisor.py` is the only place that calls Claude. Rules:
