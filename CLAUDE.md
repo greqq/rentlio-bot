@@ -51,9 +51,9 @@ Consequences to keep in mind:
 ## Language
 
 **All user-facing bot text is Croatian.** Code, comments, commit messages and
-docs are English. Croatian strings in the source avoid diacritics in the newer
-modules (c/z/s instead of ć/ž/š) because some output paths are plain text -
-match whatever the file around you already does.
+docs are English. The occupancy report uses proper diacritics - it is plain
+text in a Telegram message, so nothing forces the stripped spelling. Older
+modules mix both; match whatever the file around you already does.
 
 ## Layout
 
@@ -150,8 +150,10 @@ sign of anything being broken.
 - **Direct beats OTA by more than a discount usually recovers.** On this rate
   card a 2-night direct stay nets ~84 EUR against ~72 EUR through Booking, so
   pushing the direct rate is worth more than shaving the OTA price.
-- Rates read from the API are the **standard rate**; the channel-specific
-  plans derive from it. The report says "standardna cijena" for that reason.
+- Rates read from the API are the **standard rate** (the Booking rate card);
+  the channel-specific plans derive from it. The report says just "cijena" -
+  the host knows which card that is, and the qualifier cost a line on every
+  recommendation.
 
 ## Anthropic usage
 
