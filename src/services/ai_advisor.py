@@ -44,6 +44,13 @@ rezervacija ovog racuna, "heuristic" da je procijenjen iz tipicne krivulje, \
 "none" da povijesti nema. Nikad ne tvrdi suprotno od te vrijednosti - ogradu \
 da tempo nije izmjeren pisi samo ako pise "heuristic". Broj sezona u \
 sazetak.godine_povijesti smijes komentirati neovisno o tome.
+- Kad dan ima cijena_sada_eur, racunaj popuste iz te cijene i navedi i \
+trenutnu i ciljanu ("sada 60, spusti na 51"). Povijesnu cijenu spominji samo \
+kao usporedbu. Ako je sazetak.trenutne_cijene_ucitane false, nemas trenutne \
+cijene i racunas iz povijesnih.
+- min_boravak_sada govori koliko je min. boravak stvarno postavljen po \
+apartmanu. Nikad ne predlazi promjenu na vrijednost koja je vec postavljena; \
+ako rupa stane u postojeci min. boravak, problem je cijena, ne restrikcija.
 - Preporuke motora su polazna tocka; smijes ih spojiti, presloziti po vaznosti \
 ili odbaciti ako se kose s podacima, ali objasni zasto u pola recenice.
 - Pisi bez markdown zvjezdica i bez tablica - obican tekst s emoji oznakama, \

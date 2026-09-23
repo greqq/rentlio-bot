@@ -111,16 +111,29 @@ Does not exist (404): `/units`, `/guests`, `/rates`, `/rate-plans`,
 `/evisitor`, `/online-checkin`, `/messages`, `/account`, `/me`,
 `/properties/{id}/rate-plans|settings|webhooks`.
 
-**Current prices and minimum stay cannot be read.** `/availability` exists and
-validates its parameters (`propertiesIds`, `dateFrom`, `dateTo`, optionally
-`unitTypesIds` / `ratePlansIds`; it rejects `from`/`to` and demands both
-dates), but returns `200` with an empty list for every combination tried -
-including peak-season July with each real rate plan id. Rentlio documents an
-endpoint that *updates* rates, availability and restrictions per unit type, so
-this is almost certainly write-only in practice for this account. Do not
-re-investigate this without a new reason: the occupancy analysis therefore
-compares against what past bookings actually sold for, not against the current
-rate card, and that is a deliberate limitation rather than an oversight.
+**Current prices and minimum stay are read from the unit-type endpoints**,
+which are the ones that carry per-date values:
+
+```
+GET /unit-types/{unitTypeId}/rates         -> [{"price": 65, "date": "2026-07-03"}]
+GET /unit-types/{unitTypeId}/restrictions  -> [{"minStay": 2, "closed": false, "date": ...}]
+GET /unit-types/{unitTypeId}/availability  -> [{"availability": 0, "date": ...}]
+```
+
+All three take `dateFrom`/`dateTo` (both required for the filter to apply) and
+page with `perPage`/`page`. They serve the **standard rate** only, which is
+the one the host edits. Per rate plan there is
+`GET /unit-types/{unitTypeId}/rates/{ratePlanId}`, and writes go to
+`POST /unit-types/{id}/availrates` or
+`POST /unit-types/{unitTypeId}/rates-restrictions/{ratePlanId}` - those
+propagate to the connected OTA channels, so nothing writes without the host
+asking for it.
+
+`/availability?propertiesIds=&dateFrom=&dateTo=` is a different thing than its
+name suggests: it lists unit types that are free for **every** day of the
+period, so it legitimately answers `200 []` whenever any night in the range is
+booked. It is not a way to read rates, and an empty answer from it is not a
+sign of anything being broken.
 
 ## Anthropic usage
 

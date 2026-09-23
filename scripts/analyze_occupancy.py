@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.services import occupancy_service  # noqa: E402
 from src.services.occupancy_analyzer import (  # noqa: E402
     OccupancyAnalyzer,
+    RateInfo,
     Stay,
     shift_years,
 )
@@ -77,12 +78,28 @@ def build_demo_report(days: int):
              560, "Booking.com", "Gost 4", today - timedelta(days=15)),
     ]
 
+    # A rate calendar shaped like the live one: a price per night and a
+    # 2-night minimum that deliberately blocks the one-night orphan gap.
+    rate_calendar = {}
+    for unit in units:
+        per_day = {}
+        for offset in range(days + 1):
+            day = today + timedelta(days=offset)
+            weekend = day.weekday() >= 4
+            per_day[day] = RateInfo(
+                price=round(rng.uniform(95, 125) + (15 if weekend else 0)),
+                min_stay=2,
+                closed=False,
+            )
+        rate_calendar[unit] = per_day
+
     return OccupancyAnalyzer().analyze(
         today=today,
         horizon_days=days,
         current_stays=current,
         history=history,
         units=units,
+        rate_calendar=rate_calendar,
     )
 
 

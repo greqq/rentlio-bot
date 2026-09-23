@@ -13,15 +13,17 @@ from datetime import date, datetime, timedelta
 from typing import Optional
 
 from src.config import config
-from src.services.rentlio_api import RentlioAPI, is_live_reservation
+from src.services.rentlio_api import RentlioAPI, RentlioAPIError, is_live_reservation
 from src.services.occupancy_analyzer import (
     Gap,
     OccupancyAnalyzer,
     OccupancyReport,
     PricingConfig,
+    RateInfo,
     Stay,
     parse_stays,
     shift_years,
+    to_date,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,6 +80,76 @@ async def _fetch_stays(
     return parse_stays(live)
 
 
+async def _fetch_rate_calendar(
+    api: RentlioAPI,
+    property_id: Optional[str],
+    start: date,
+    end: date,
+) -> dict[str, dict[date, RateInfo]]:
+    """
+    What the host currently has listed: price and minimum stay per night.
+
+    Rates and restrictions hang off unit *types*, not units, and the two carry
+    different ids - asking with a unit id answers 403, which looks like a
+    permissions problem and is not. Unit type names match the unit names that
+    reservations report, which is how the two sides are joined here.
+
+    Returns {} rather than raising: the analysis still works off historical
+    prices, it just cannot quote the host's own rate back to them.
+    """
+    if not property_id:
+        try:
+            properties = await api.get_properties()
+        except RentlioAPIError as e:
+            logger.warning("Could not list properties for rates: %s", e)
+            return {}
+        if len(properties) != 1:
+            return {}
+        property_id = str(properties[0].get("id", ""))
+
+    try:
+        unit_types = await api.get_unit_types(property_id)
+    except RentlioAPIError as e:
+        logger.warning("Could not list unit types: %s", e)
+        return {}
+
+    date_from = start.strftime("%Y-%m-%d")
+    date_to = end.strftime("%Y-%m-%d")
+    calendar: dict[str, dict[date, RateInfo]] = {}
+
+    for unit_type in unit_types:
+        type_id = unit_type.get("id")
+        name = (unit_type.get("name") or "").strip()
+        if type_id is None or not name:
+            continue
+        try:
+            rates = await api.get_unit_type_rates(str(type_id), date_from, date_to)
+            restrictions = await api.get_unit_type_restrictions(
+                str(type_id), date_from, date_to
+            )
+        except RentlioAPIError as e:
+            logger.warning("Rates unavailable for unit type %s: %s", type_id, e)
+            continue
+
+        per_day: dict[date, RateInfo] = {}
+        for row in rates:
+            day = to_date(row.get("date"))
+            if day:
+                per_day.setdefault(day, RateInfo()).price = row.get("price")
+        for row in restrictions:
+            day = to_date(row.get("date"))
+            if not day:
+                continue
+            info = per_day.setdefault(day, RateInfo())
+            info.min_stay = row.get("minStay") or None
+            info.closed = bool(row.get("closed"))
+
+        if per_day:
+            calendar[name] = per_day
+
+    return calendar
+
+
 async def run_analysis(
     api: RentlioAPI,
     horizon_days: int = 30,
@@ -123,6 +195,8 @@ async def run_analysis(
         # A quiet horizon can hide an apartment entirely; keep the denominator honest.
         units = units + [f"Apartman {i}" for i in range(len(units) + 1, config.RENTLIO_TOTAL_UNITS + 1)]
 
+    rate_calendar = await _fetch_rate_calendar(api, property_id, today, end)
+
     analyzer = OccupancyAnalyzer(pricing)
     report = analyzer.analyze(
         today=today,
@@ -130,6 +204,7 @@ async def run_analysis(
         current_stays=current,
         history=history,
         units=units,
+        rate_calendar=rate_calendar,
     )
 
     _cache[cache_key] = (time.time(), report)
@@ -189,6 +264,19 @@ def format_summary(report: OccupancyReport) -> str:
             f"💸 Slobodne noci vrijede ~{report.free_nights_value:.0f} EUR "
             "po prosjecnim cijenama prijasnjih godina"
         )
+
+    live = [d.free_price for d in report.days if d.free_price]
+    hist = [d.hist_adr for d in report.days if d.hist_adr]
+    if live:
+        live_avg = sum(live) / len(live)
+        line = f"🏷️ Tvoja cijena na slobodnim nocima: ~{live_avg:.0f} EUR"
+        if hist:
+            hist_avg = sum(hist) / len(hist)
+            delta = live_avg - hist_avg
+            smjer = "iznad" if delta >= 0 else "ispod"
+            line += f" ({abs(delta):.0f} EUR {smjer} povijesnog prosjeka od {hist_avg:.0f} EUR)"
+        lines.append(line)
+
     return "\n".join(lines)
 
 
@@ -224,7 +312,11 @@ def format_actions(report: OccupancyReport, limit: int = 10) -> str:
 
 def format_calendar(report: OccupancyReport, max_days: int = 62) -> str:
     """Night-by-night view - free apartments and how the date used to sell."""
-    lines = ["🗓️ KALENDAR (slobodno / povijesno)", ""]
+    lines = [
+        "🗓️ KALENDAR (povijesna popunjenost / tvoja cijena / min. boravak)",
+        "   * uz cijenu = povijesni prosjek, trenutna nije ucitana",
+        "",
+    ]
     month = None
     for day in report.days[:max_days]:
         if day.day.month != month:
@@ -240,9 +332,17 @@ def format_calendar(report: OccupancyReport, max_days: int = 62) -> str:
             f"pov. {day.hist_occupancy * 100:>3.0f}%"
             if day.hist_occupancy is not None else "pov.   -"
         )
-        price = f"{day.hist_adr:>4.0f}EUR" if day.hist_adr else "       "
+        now = day.free_price or (
+            sum(i.price for i in day.rates.values() if i.price) / len(day.rates)
+            if day.rates and any(i.price for i in day.rates.values()) else None
+        )
+        price = f"{now:>4.0f}EUR" if now else (
+            f"{day.hist_adr:>4.0f}EUR*" if day.hist_adr else "       "
+        )
+        stays = {i.min_stay for i in day.rates.values() if i.min_stay}
+        min_stay = f" min{min(stays)}" if stays else ""
         free = ", ".join(day.free_unit_names) if day.free_unit_names else "puno"
-        lines.append(f"{marker} {_fmt_day(day.day)}  {hist} {price}  {free}")
+        lines.append(f"{marker} {_fmt_day(day.day)}  {hist} {price}{min_stay}  {free}")
     return "\n".join(lines)
 
 
@@ -255,12 +355,16 @@ def format_gaps(report: OccupancyReport, limit: int = 12) -> str:
         return (0 if gap.is_orphan else 1, gap.nights, gap.lead_days)
 
     lines = ["🕳️ SLOBODNI TERMINI", ""]
+    by_day = {d.day: d for d in report.days}
     for gap in sorted(report.gaps, key=sort_key)[:limit]:
         tag = " (izmedu dvije rezervacije)" if gap.is_orphan else ""
         value = f", ~{gap.lost_value:.0f} EUR" if gap.lost_value else ""
+        day = by_day.get(gap.start)
+        min_stay = day.current_min_stay(gap.unit) if day else None
+        blocked = " ⛔ min. boravak " + str(min_stay) if min_stay and min_stay > gap.nights else ""
         lines.append(
             f"• {gap.unit}: {_fmt_range(gap.start, gap.end)} - "
-            f"{gap.nights} {'noc' if gap.nights == 1 else 'noci'}{tag}{value}"
+            f"{gap.nights} {'noc' if gap.nights == 1 else 'noci'}{tag}{value}{blocked}"
         )
     return "\n".join(lines)
 

@@ -123,6 +123,15 @@ class Stay:
 
 
 @dataclass
+class RateInfo:
+    """What the host currently has set for one apartment on one night."""
+
+    price: Optional[float] = None
+    min_stay: Optional[int] = None   # 0 / None means no minimum is set
+    closed: bool = False
+
+
+@dataclass
 class DayStat:
     """Everything known about one future night."""
 
@@ -135,6 +144,27 @@ class DayStat:
     hist_occupancy: Optional[float] = None   # 0-1, same period in past seasons
     hist_adr: Optional[float] = None         # average past price per night
     expected_occupancy: Optional[float] = None  # hist final occ x pickup curve
+    rates: dict = field(default_factory=dict)   # unit name -> RateInfo, as set today
+
+    def current_price(self, unit: str) -> Optional[float]:
+        info = self.rates.get(unit)
+        return info.price if info else None
+
+    def current_min_stay(self, unit: str) -> Optional[int]:
+        info = self.rates.get(unit)
+        return info.min_stay if info else None
+
+    @property
+    def free_price(self) -> Optional[float]:
+        """Average listed price across the apartments still free that night."""
+        prices = [
+            self.rates[u].price
+            for u in self.free_unit_names
+            if u in self.rates and self.rates[u].price
+        ]
+        if not prices:
+            return None
+        return sum(prices) / len(prices)
 
     @property
     def occupancy(self) -> float:
@@ -206,6 +236,7 @@ class Action:
 
 @dataclass
 class OccupancyReport:
+    has_live_rates: bool
     generated_at: datetime
     start: date
     end: date
@@ -287,6 +318,7 @@ class OccupancyReport:
                 "vrijednost_slobodnih_nocenja_eur": round(self.free_nights_value),
                 "izvor_tempa": self.pace_source,
                 "godine_povijesti": self.history_years,
+                "trenutne_cijene_ucitane": self.has_live_rates,
             },
             "dani": [
                 {
@@ -300,6 +332,15 @@ class OccupancyReport:
                         round(d.hist_occupancy * 100) if d.hist_occupancy is not None else None
                     ),
                     "povijesna_cijena_eur": round(d.hist_adr) if d.hist_adr else None,
+                    "cijena_sada_eur": {
+                        unit: round(info.price)
+                        for unit, info in d.rates.items() if info.price
+                    } or None,
+                    "min_boravak_sada": {
+                        unit: info.min_stay
+                        for unit, info in d.rates.items() if info.min_stay
+                    } or None,
+                    "zatvoreno": [u for u, i in d.rates.items() if i.closed] or None,
                     "ocekivano_pct": (
                         round(d.expected_occupancy * 100) if d.expected_occupancy is not None else None
                     ),
@@ -441,7 +482,13 @@ class OccupancyAnalyzer:
         current_stays: list[Stay],
         history: dict[int, list[Stay]],
         units: list[str],
+        rate_calendar: Optional[dict] = None,
     ) -> OccupancyReport:
+        """
+        rate_calendar maps unit name -> {date: RateInfo} with what the host
+        currently has listed. When present the advice is expressed against
+        those real prices and minimum stays instead of historical averages.
+        """
         cfg = self.config
         start = today
         end = today + timedelta(days=horizon_days - 1)
@@ -485,6 +532,12 @@ class OccupancyAnalyzer:
             if hist["occupancy"] is not None:
                 expected = min(1.0, hist["occupancy"] * _pickup(pickup_curve, offset))
 
+            rates = {}
+            for unit in units:
+                info = (rate_calendar or {}).get(unit, {}).get(day)
+                if info:
+                    rates[unit] = info
+
             days.append(DayStat(
                 day=day,
                 total_units=total_units,
@@ -495,13 +548,22 @@ class OccupancyAnalyzer:
                 hist_occupancy=hist["occupancy"],
                 hist_adr=hist["adr"],
                 expected_occupancy=expected,
+                rates=rates,
             ))
 
         gaps = self._find_gaps(days, units, current_stays, start, end)
         weekday_occ = self._weekday_occupancy(hist_index)
         actions = self._build_actions(days, gaps, weekday_occ)
 
+        has_live_rates = any(d.rates for d in days)
+        if not has_live_rates:
+            notes.append(
+                "Trenutne cijene iz Rentlija nisu ucitane - preporuke se racunaju "
+                "iz prosjecnih cijena prijasnjih sezona."
+            )
+
         return OccupancyReport(
+            has_live_rates=has_live_rates,
             generated_at=datetime.now(),
             start=start,
             end=end,
@@ -747,24 +809,55 @@ class OccupancyAnalyzer:
     ) -> list[Action]:
         cfg = self.config
         actions: list[Action] = []
+        by_day = {d.day: d for d in days}
 
-        # 1. Gaps that physically cannot be booked at a 2-night minimum.
+        # 1. Gaps too short to be bookable at the minimum stay actually set.
+        # Knowing the real minimum matters: telling the host to lower it to 2
+        # when it already is 2 wastes the most urgent slot in the report.
         for gap in gaps:
             if gap.truncated and not gap.closed_before:
                 continue
-            if gap.nights <= cfg.orphan_gap_nights and gap.is_orphan:
-                discount = _discount_for_lead(gap.lead_days, cfg)
+            if not (gap.is_orphan and gap.nights <= 4):
+                continue
+            if gap.nights > cfg.orphan_gap_nights and gap.lead_days > 30:
+                continue
+
+            first_day = by_day.get(gap.start)
+            current_min = first_day.current_min_stay(gap.unit) if first_day else None
+            current_price = first_day.current_price(gap.unit) if first_day else None
+            blocked = current_min is None or current_min > gap.nights
+            discount = _discount_for_lead(gap.lead_days, cfg)
+            nights_word = "noc" if gap.nights == 1 else "noci"
+
+            price_hint = ""
+            if current_price:
+                price_hint = (
+                    f" Cijena je sada {current_price:.0f} EUR, "
+                    f"s popustom ~{current_price * (100 - discount) / 100:.0f} EUR."
+                )
+
+            if blocked:
+                if current_min:
+                    reason = (
+                        f"Min. boravak je postavljen na {current_min} noci, a rupa je "
+                        f"{gap.nights} - tako je nitko ne moze rezervirati."
+                    )
+                else:
+                    reason = (
+                        f"Uz minimalni boravak veci od {gap.nights} nitko to ne moze "
+                        "rezervirati."
+                    )
                 actions.append(Action(
                     kind="min_stay",
                     title=(
-                        f"{gap.unit}: rupa od {gap.nights} "
-                        f"{'noc' if gap.nights == 1 else 'noci'} izmedu dvije rezervacije"
+                        f"{gap.unit}: rupa od {gap.nights} {nights_word} "
+                        "izmedu dvije rezervacije"
                     ),
                     detail=(
                         f"{_fmt_range(gap.start, gap.end)} je zatvoreno s obje strane. "
-                        f"Uz minimalni boravak veci od {gap.nights} nitko to ne moze rezervirati - "
-                        f"spusti min. boravak na {gap.nights} i daj {discount}% popusta, "
-                        f"ili ponudi produljenje gostu prije/poslije."
+                        f"{reason} Spusti min. boravak na {gap.nights} i daj "
+                        f"{discount}% popusta, ili ponudi produljenje gostu "
+                        f"prije/poslije.{price_hint}"
                     ),
                     start=gap.start,
                     end=gap.end,
@@ -773,23 +866,34 @@ class OccupancyAnalyzer:
                     discount_pct=discount,
                     min_stay=gap.nights,
                     value_at_risk=gap.lost_value,
-                    metrics={"noci": gap.nights, "dana_do": gap.lead_days},
+                    metrics={
+                        "noci": gap.nights,
+                        "dana_do": gap.lead_days,
+                        "min_boravak_sada": current_min,
+                    },
                 ))
-            elif gap.is_orphan and gap.nights <= 4 and gap.lead_days <= 30:
+            else:
+                # The minimum stay already lets this gap be booked, so the
+                # remaining lever is the price.
                 actions.append(Action(
-                    kind="min_stay",
-                    title=f"{gap.unit}: kratka rupa {gap.nights} noci",
+                    kind="discount",
+                    title=f"{gap.unit}: rupa {gap.nights} {nights_word} se ne prodaje",
                     detail=(
-                        f"{_fmt_range(gap.start, gap.end)} - postavi min. boravak tocno na "
-                        f"{gap.nights} noci da termin uopce bude vidljiv u trazilicama."
+                        f"{_fmt_range(gap.start, gap.end)}, izmedu dvije rezervacije. "
+                        f"Min. boravak je vec {current_min}, dakle termin je vidljiv - "
+                        f"ostaje cijena.{price_hint}"
                     ),
                     start=gap.start,
                     end=gap.end,
-                    priority=2,
+                    priority=1 if gap.lead_days <= 21 else 2,
                     unit=gap.unit,
-                    min_stay=gap.nights,
+                    discount_pct=discount,
                     value_at_risk=gap.lost_value,
-                    metrics={"noci": gap.nights, "dana_do": gap.lead_days},
+                    metrics={
+                        "noci": gap.nights,
+                        "dana_do": gap.lead_days,
+                        "min_boravak_sada": current_min,
+                    },
                 ))
 
         # 2. Stretches that are selling slower than the season normally does.
@@ -813,10 +917,26 @@ class OccupancyAnalyzer:
             hist = [d.hist_occupancy for d in run if d.hist_occupancy is not None]
             hist_avg = sum(hist) / len(hist) if hist else None
             value = sum((d.hist_adr or 0) * d.free_units for d in run)
-            ref_price = [d.hist_adr for d in run if d.hist_adr]
+
+            # Prefer what the host has listed right now; fall back to what
+            # those dates historically sold for when live rates are missing.
+            live_prices = [d.free_price for d in run if d.free_price]
+            hist_prices = [d.hist_adr for d in run if d.hist_adr]
             price_hint = ""
-            if ref_price:
-                avg_price = sum(ref_price) / len(ref_price)
+            if live_prices:
+                avg_price = sum(live_prices) / len(live_prices)
+                target = avg_price * (100 - discount) / 100
+                price_hint = (
+                    f" Sada ti je ~{avg_price:.0f} EUR po noci - spusti na "
+                    f"~{target:.0f} EUR."
+                )
+                if hist_prices:
+                    hist_avg_price = sum(hist_prices) / len(hist_prices)
+                    price_hint += (
+                        f" (Prijasnjih sezona se prodavalo po ~{hist_avg_price:.0f} EUR.)"
+                    )
+            elif hist_prices:
+                avg_price = sum(hist_prices) / len(hist_prices)
                 price_hint = (
                     f" Prosjecna cijena tih datuma prijasnjih godina: {avg_price:.0f} EUR, "
                     f"s popustom ~{avg_price * (100 - discount) / 100:.0f} EUR."
@@ -876,15 +996,29 @@ class OccupancyAnalyzer:
             d for d in days
             if d.lead_days <= cfg.last_minute_days and d.free_units > 0
         ]
-        if soon:
+        blocking_min_stays = [
+            (d.current_min_stay(u) or 0)
+            for d in soon for u in d.free_unit_names
+            if (d.current_min_stay(u) or 0) > 1
+        ]
+        live_min_known = any(d.rates for d in soon)
+        if soon and (blocking_min_stays or not live_min_known):
             value = sum((d.hist_adr or 0) * d.free_units for d in soon)
+            if blocking_min_stays:
+                lead_detail = (
+                    f"Na tim nocima min. boravak je jos {max(blocking_min_stays)} - "
+                    "spusti ga na 1 i ukljuci last-minute popust, te noci inace "
+                    "propadaju bez prihoda."
+                )
+            else:
+                lead_detail = (
+                    "Za termine unutar tjedna spusti minimalni boravak na 1 noc i ukljuci "
+                    "last-minute popust - te noci inace propadaju bez prihoda."
+                )
             actions.append(Action(
                 kind="min_stay",
                 title=f"Zadnji cas: {len(soon)} slobodnih noci u iducih {cfg.last_minute_days} dana",
-                detail=(
-                    "Za termine unutar tjedna spusti minimalni boravak na 1 noc i ukljuci "
-                    "last-minute popust - te noci inace propadaju bez prihoda."
-                ),
+                detail=lead_detail,
                 start=soon[0].day,
                 end=soon[-1].day,
                 priority=1,
