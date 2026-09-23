@@ -144,7 +144,10 @@ sign of anything being broken.
   the only lever is opening the minimum stay, plus offering the neighbouring
   guest an extension, which costs no turnaround at all.
 - **`PRICE_FLOORS` caps every discount.** Below the floor a night stops paying
-  for its turnaround. When the floor makes the remaining discount negligible
+  for its turnaround. The figure is on the **standard rate** scale, since that
+  is what the API returns and what a recommendation moves - a floor copied
+  from a cheaper derived plan (the direct-booking tier, say) silently lets the
+  standard rate fall further than the host intended. When the floor makes the remaining discount negligible
   (<3%), the report says the price lever is spent and points at minimum stay
   or direct bookings instead of advising a 1% cut.
 - **Direct beats OTA by more than a discount usually recovers.** On this rate
