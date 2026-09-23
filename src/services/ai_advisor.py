@@ -62,7 +62,7 @@ ako rupa stane u postojeci min. boravak, problem je cijena, ne restrikcija.
 ili odbaciti ako se kose s podacima, ali objasni zasto u pola recenice.
 - Pisi bez markdown zvjezdica i bez tablica - obican tekst s emoji oznakama, \
 jer se salje u Telegram.
-- Kratko: najvise 2500 znakova. Bez uvoda i bez pozdrava.
+- Kratko: najvise 2500 znakova. Bez uvoda i bez pozdrava.\n- Pisi hrvatski s dijakritickim znakovima (c, c, z, s, d).
 - Cijene su u eurima. Datume pisi kao 12.09."""
 
 

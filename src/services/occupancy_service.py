@@ -28,7 +28,7 @@ from src.services.occupancy_analyzer import (
 
 logger = logging.getLogger(__name__)
 
-WEEKDAYS_HR = ["pon", "uto", "sri", "cet", "pet", "sub", "ned"]
+WEEKDAYS_HR = ["pon", "uto", "sri", "čet", "pet", "sub", "ned"]
 MONTHS_HR = [
     "sijecanj", "veljaca", "ozujak", "travanj", "svibanj", "lipanj",
     "srpanj", "kolovoz", "rujan", "listopad", "studeni", "prosinac",
@@ -227,7 +227,7 @@ def _fmt_day(day: date) -> str:
 def _fmt_range(start: date, end: date) -> str:
     if start == end:
         return _fmt_day(start)
-    return f"{_fmt_day(start)} - {_fmt_day(end)}"
+    return f"{_fmt_day(start)} – {_fmt_day(end)}"
 
 
 def _bar(value: float, width: int = 10) -> str:
@@ -236,146 +236,165 @@ def _bar(value: float, width: int = 10) -> str:
 
 
 def format_summary(report: OccupancyReport) -> str:
-    """Headline numbers: where occupancy stands versus previous seasons."""
+    """Headline: where occupancy stands against previous seasons."""
     lines = [
-        f"📊 ANALIZA POPUNJENOSTI - iducih {report.horizon_days} dana",
-        f"📅 {report.start.strftime('%d.%m.%Y')} - {report.end.strftime('%d.%m.%Y')}",
-        f"🏠 {len(report.units)} apartmana: {', '.join(report.units)}",
+        f"📊 ANALIZA · idućih {report.horizon_days} dana",
+        f"{report.start.strftime('%d.%m')} – {report.end.strftime('%d.%m.%Y')}"
+        f" · {', '.join(report.units)}",
         "",
-        f"Popunjenost: {_bar(report.occupancy)} {report.occupancy * 100:.0f}%",
+        f"Sada    {_bar(report.occupancy)}  {report.occupancy * 100:.0f}%",
     ]
 
     hist = report.hist_occupancy
     if hist is not None:
         delta = (report.occupancy - hist) * 100
-        arrow = "🟢 iznad" if delta >= 0 else "🔴 ispod"
+        lines.append(f"Prije   {_bar(hist)}  {hist * 100:.0f}%")
         years = ", ".join(str(report.start.year - y) for y in report.history_years)
-        lines.append(
-            f"Povijest:    {_bar(hist)} {hist * 100:.0f}%  "
-            f"({arrow} prosjeka za {abs(delta):.0f} p.b.; sezone {years})"
-        )
+        mark = "🟢" if delta >= 0 else "🔴"
+        smjer = "iznad" if delta >= 0 else "ispod"
+        lines.append(f"{mark} {abs(delta):.0f} p.b. {smjer} prosjeka ({years})")
 
     free = report.total_unit_nights - report.booked_unit_nights
     lines += [
         "",
-        f"🛏️ Prodano {report.booked_unit_nights}/{report.total_unit_nights} nocenja, "
-        f"slobodno {free}",
-        f"💰 Rezerviran prihod: {report.booked_revenue:.0f} EUR",
+        f"🛏 {report.booked_unit_nights}/{report.total_unit_nights} noćenja prodano"
+        f" · {free} slobodno",
+        f"💰 {report.booked_revenue:.0f} € rezervirano",
     ]
     if report.free_nights_value:
-        lines.append(
-            f"💸 Slobodne noci vrijede ~{report.free_nights_value:.0f} EUR "
-            "po prosjecnim cijenama prijasnjih godina"
-        )
+        lines.append(f"💸 ~{report.free_nights_value:.0f} € leži u slobodnim noćima")
 
     live = [d.free_price for d in report.days if d.free_price]
-    hist = [d.hist_adr for d in report.days if d.hist_adr]
     if live:
         live_avg = sum(live) / len(live)
-        line = f"🏷️ Tvoja cijena na slobodnim nocima: ~{live_avg:.0f} EUR"
-        if hist:
-            hist_avg = sum(hist) / len(hist)
+        line = f"🏷 Tvoja cijena: ~{live_avg:.0f} €"
+        hist_prices = [d.hist_adr for d in report.days if d.hist_adr]
+        if hist_prices:
+            hist_avg = sum(hist_prices) / len(hist_prices)
             delta = live_avg - hist_avg
-            smjer = "iznad" if delta >= 0 else "ispod"
-            line += f" ({abs(delta):.0f} EUR {smjer} povijesnog prosjeka od {hist_avg:.0f} EUR)"
+            if abs(delta) < 1:
+                line += " (u rangu prijašnjih sezona)"
+            else:
+                smjer = "iznad" if delta >= 0 else "ispod"
+                line += f" ({abs(delta):.0f} € {smjer} prijašnjih sezona)"
         lines.append(line)
 
     return "\n".join(lines)
 
 
 def format_actions(report: OccupancyReport, limit: int = 10) -> str:
-    """The part the host acts on: what to change, where, and why."""
+    """
+    The part the host acts on.
+
+    One block per action: when and where, the move, then a single line of why.
+    Telegram renders a proportional font, so the layout leans on short lines
+    and blank space rather than aligned columns.
+    """
     if not report.actions:
-        return "✅ Nema hitnih preporuka - kalendar prati ocekivani tempo."
+        return "✅ Nema hitnih preporuka — kalendar prati očekivani tempo."
 
-    icons = {"discount": "💸", "min_stay": "🔒", "raise": "📈", "hold": "⏸️", "info": "ℹ️"}
-    priority_labels = {1: "ODMAH", 2: "OVAJ TJEDAN", 3: "PRATI"}
+    icons = {
+        "discount": "💸", "min_stay": "🔓", "raise": "📈",
+        "hold": "⏸", "info": "ℹ️",
+    }
+    headers = {1: "ODMAH", 2: "OVAJ TJEDAN", 3: "PRATI"}
 
-    lines = ["🎯 PREPORUKE", ""]
+    lines: list[str] = []
     current_priority = None
     for action in report.actions[:limit]:
         if action.priority != current_priority:
             current_priority = action.priority
-            lines.append(f"— {priority_labels.get(action.priority, '')} —")
-        icon = icons.get(action.kind, "•")
-        lines.append(f"{icon} {action.title}")
-        lines.append(f"   {action.detail}")
-        bits = []
-        if action.discount_pct:
-            bits.append(f"popust {action.discount_pct}%")
-        if action.min_stay:
-            bits.append(f"min. boravak {action.min_stay}")
+            label = headers.get(action.priority, "")
+            while lines and not lines[-1]:
+                lines.pop()
+            if lines:
+                lines.append("")
+            lines += [f"━━━━━  {label}  ━━━━━", ""]
+
+        lines.append(f"{icons.get(action.kind, '•')} {action.title}")
+        lines.append(f"    {action.move}")
+        lines.append(f"    {action.why}")
         if action.value_at_risk:
-            bits.append(f"~{action.value_at_risk:.0f} EUR u igri")
-        if bits:
-            lines.append(f"   👉 {' | '.join(bits)}")
+            lines.append(f"    ~{action.value_at_risk:.0f} € u igri")
         lines.append("")
-    return "\n".join(lines).rstrip()
+
+    return "\n".join(lines).strip()
 
 
 def format_calendar(report: OccupancyReport, max_days: int = 62) -> str:
-    """Night-by-night view - free apartments and how the date used to sell."""
-    lines = [
-        "🗓️ KALENDAR (povijesna popunjenost / tvoja cijena / min. boravak)",
-        "   * uz cijenu = povijesni prosjek, trenutna nije ucitana",
-        "",
-    ]
+    """Night by night: what is free, your price, the minimum stay."""
+    lines = ["🗓 KALENDAR", "🟩 puno · 🟨 djelomično · 🟥 prazno", ""]
     month = None
     for day in report.days[:max_days]:
         if day.day.month != month:
+            if month is not None:
+                lines.append("")
             month = day.day.month
-            lines.append(f"▸ {MONTHS_HR[day.day.month - 1]} {day.day.year}")
+            lines.append(f"▸ {MONTHS_HR[day.day.month - 1]}")
         if day.free_units == 0:
             marker = "🟩"
         elif day.free_units == day.total_units:
             marker = "🟥"
         else:
             marker = "🟨"
-        hist = (
-            f"pov. {day.hist_occupancy * 100:>3.0f}%"
-            if day.hist_occupancy is not None else "pov.   -"
+
+        bits = []
+        price = day.free_price or next(
+            (i.price for i in day.rates.values() if i.price), None
         )
-        now = day.free_price or (
-            sum(i.price for i in day.rates.values() if i.price) / len(day.rates)
-            if day.rates and any(i.price for i in day.rates.values()) else None
-        )
-        price = f"{now:>4.0f}EUR" if now else (
-            f"{day.hist_adr:>4.0f}EUR*" if day.hist_adr else "       "
-        )
+        if price:
+            bits.append(f"{price:.0f} €")
+        elif day.hist_adr:
+            bits.append(f"~{day.hist_adr:.0f} €*")
         stays = {i.min_stay for i in day.rates.values() if i.min_stay}
-        min_stay = f" min{min(stays)}" if stays else ""
-        free = ", ".join(day.free_unit_names) if day.free_unit_names else "puno"
-        lines.append(f"{marker} {_fmt_day(day.day)}  {hist} {price}{min_stay}  {free}")
+        if stays:
+            bits.append(f"min {min(stays)}")
+        if day.hist_occupancy is not None:
+            bits.append(f"prije {day.hist_occupancy * 100:.0f}%")
+        if day.free_unit_names:
+            bits.append(", ".join(day.free_unit_names))
+
+        lines.append(f"{marker} {_fmt_day(day.day)} · " + " · ".join(bits))
+
+    lines.append("")
+    lines.append("* povijesna cijena, trenutna nije učitana")
     return "\n".join(lines)
 
 
 def format_gaps(report: OccupancyReport, limit: int = 12) -> str:
-    """Free stretches per apartment, shortest and most urgent first."""
+    """Free stretches per apartment, most urgent first."""
     if not report.gaps:
         return "🎉 Nema slobodnih termina u ovom razdoblju."
 
     def sort_key(gap: Gap):
         return (0 if gap.is_orphan else 1, gap.nights, gap.lead_days)
 
-    lines = ["🕳️ SLOBODNI TERMINI", ""]
     by_day = {d.day: d for d in report.days}
+    lines = ["🕳 SLOBODNI TERMINI", ""]
     for gap in sorted(report.gaps, key=sort_key)[:limit]:
-        tag = " (izmedu dvije rezervacije)" if gap.is_orphan else ""
-        value = f", ~{gap.lost_value:.0f} EUR" if gap.lost_value else ""
+        nights_word = "noć" if gap.nights == 1 else "noći"
+        head = f"{gap.unit} · {_fmt_range(gap.start, gap.end)} · {gap.nights} {nights_word}"
+        lines.append(head)
+
+        notes = []
+        if gap.is_orphan:
+            notes.append("između dvije rezervacije")
         day = by_day.get(gap.start)
         min_stay = day.current_min_stay(gap.unit) if day else None
-        blocked = " ⛔ min. boravak " + str(min_stay) if min_stay and min_stay > gap.nights else ""
-        lines.append(
-            f"• {gap.unit}: {_fmt_range(gap.start, gap.end)} - "
-            f"{gap.nights} {'noc' if gap.nights == 1 else 'noci'}{tag}{value}{blocked}"
-        )
-    return "\n".join(lines)
+        if min_stay and min_stay > gap.nights:
+            notes.append(f"⛔ blokira min. boravak {min_stay}")
+        if gap.lost_value:
+            notes.append(f"~{gap.lost_value:.0f} €")
+        if notes:
+            lines.append("    " + " · ".join(notes))
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def format_notes(report: OccupancyReport) -> str:
     if not report.notes:
         return ""
-    return "ℹ️ " + "\n   ".join(report.notes)
+    return "\n".join(f"ℹ️ {note}" for note in report.notes)
 
 
 def split_message(text: str, limit: int = 3800) -> list[str]:
@@ -402,5 +421,5 @@ def format_full_report(report: OccupancyReport, include_calendar: bool = False) 
     notes = format_notes(report)
     if notes:
         sections.append(notes)
-    sections.append(f"⏱️ Generirano {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+    sections.append(f"⏱ {datetime.now().strftime('%d.%m.%Y %H:%M')}")
     return split_message("\n\n".join(s for s in sections if s))
